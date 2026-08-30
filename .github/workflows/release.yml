@@ -1,0 +1,79 @@
+name: Release
+
+# Tag-triggered, and for a Go module the tag IS the release — there is no publish step and no
+# registry credential. `go get` resolves `vX.Y.Z` straight from this repository through the
+# module proxy, which means a mistagged commit is public the moment it is pushed and cannot be
+# replaced: the proxy caches by version forever. So everything below runs BEFORE the tag is
+# treated as good, and the only remedy for a bad one is a new version.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: verify the tag before anyone can consume it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: The module must still have no dependencies
+        run: |
+          if [ -s go.sum ]; then
+            echo "::error::go.sum is not empty; this module is meant to have no dependencies"
+            cat go.sum
+            exit 1
+          fi
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -race
+      - run: go run ./cmd/credenshare-conformance -v
+
+      - name: The Version constant must match the tag
+        # Go modules carry no version field, so `Version` in client.go is the only place the
+        # library can report itself — in the User-Agent, in a bug report. Nothing links it to
+        # the tag, so without this check the two drift on the first release and every request
+        # afterwards misreports which code is running.
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CONST=$(grep -oE 'Version = "[^"]+"' client.go | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [ "$TAG" != "$CONST" ]; then
+            echo "::error::tag v$TAG does not match the Version constant $CONST in client.go"
+            exit 1
+          fi
+          echo "releasing $CONST"
+
+      - name: A v2 or later tag needs a module path to match
+        # Go's import-compatibility rule: from v2 on, the major version must be a suffix on
+        # the module path (`.../credenshare-sdk-go/v2`). Tagging v2.0.0 without moving the
+        # path produces a version the proxy serves and `go get` cannot resolve — a broken
+        # release that looks published. Caught here rather than in somebody's build.
+        run: |
+          MAJOR="${GITHUB_REF_NAME#v}"; MAJOR="${MAJOR%%.*}"
+          MODULE=$(head -1 go.mod | awk '{print $2}')
+          if [ "$MAJOR" -ge 2 ] && [ "${MODULE%/v$MAJOR}" = "$MODULE" ]; then
+            echo "::error::tag $GITHUB_REF_NAME is v$MAJOR but the module path is '$MODULE'; it must end in /v$MAJOR"
+            exit 1
+          fi
+
+      - name: Publish the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Install: \`go get github.com/CredenShare/credenshare-sdk-go@$GITHUB_REF_NAME\`
+
+          Verify the install against the published specification:
+
+          \`\`\`
+          go run github.com/CredenShare/credenshare-sdk-go/cmd/credenshare-conformance@$GITHUB_REF_NAME -v
+          \`\`\`
+
+          See CHANGELOG.md for what changed."
