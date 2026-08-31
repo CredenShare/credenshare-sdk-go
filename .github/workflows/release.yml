@@ -32,7 +32,12 @@ jobs:
 
       - run: go build ./...
       - run: go vet ./...
+      # Same opt-in variable CI uses. Without it here, a release is the only build that
+      # never checks the fixture against the canonical copy - and it is the one that
+      # cannot be taken back.
       - run: go test ./... -race
+        env:
+          CREDENSHARE_VECTORS_URL: ${{ vars.CREDENSHARE_VECTORS_URL }}
       - run: go run ./cmd/credenshare-conformance -v
 
       - name: The Version constant must match the tag
