@@ -207,7 +207,7 @@ self-consistency.
 
 ### One Go-specific trap, handled
 
-`encoding/json` escapes `<`, `>` and `&` as `<`, `>` and `&` by default. No
+`encoding/json` escapes `<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026` by default. No
 other implementation escapes, so a field containing any of them would produce a blob this
 client can decrypt and no other client can reproduce. This SDK turns the escaping off — in
 `EncryptContent` and in `Field`'s own marshaller, since the package-level `json.Marshal`
