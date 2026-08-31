@@ -5,7 +5,7 @@ never reaches CredenShare, which is what makes "we cannot read your data" a prop
 system rather than a promise.
 
 ```bash
-go get github.com/CredenShare/credenshare-sdk-go
+go get github.com/CredenShare/credenshare-sdk-go@v0.1.0
 ```
 
 ```go
