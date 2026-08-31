@@ -1,15 +1,15 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — released 2026-08-30
 
 First release.
 
-### Breaking, before the first release
+### Breaking, before v0.1.0
 
-Nothing is published yet, so nothing is pinned to a version — but these repositories are
-public with no tags, which means pinning to a **commit** is the only thing a consumer can do.
-These three stop such a consumer's code from compiling, and each was the right fix for a real
-defect:
+These landed before `v0.1.0` was tagged, so no released version ever had the old shape and
+nothing in the wild breaks. They are recorded because the repository is public and someone may
+have pinned to a commit from the window before the tag existed — and because each was the right
+fix for a real defect, which is worth stating alongside the break:
 
 - **`Field` is no longer comparable.** It gained an `Extra map[string]json.RawMessage` member
   so that unknown members survive a decrypt/re-encrypt round trip; a struct containing a map

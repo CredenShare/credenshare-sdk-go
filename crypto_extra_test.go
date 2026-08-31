@@ -96,6 +96,6 @@ func TestFieldMarshallingDoesNotEscapeHTML(t *testing.T) {
 	}
 
 	// The wire-plaintext half of this - that the same bytes survive EncryptContent's outer
-	// encoder - is asserted by TestHtmlEscapableCharactersSurviveUnescaped in
+	// encoder - is asserted by TestJSONHTMLEscapingIsOff in
 	// conformance_test.go, which opens the blob by hand. Not duplicated here.
 }

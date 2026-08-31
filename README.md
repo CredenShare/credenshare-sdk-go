@@ -202,7 +202,7 @@ The vectors are embedded with `go:embed`, so they travel with the binary and can
 in a container that shipped only the executable:
 
 ```bash
-go run github.com/CredenShare/credenshare-sdk-go/cmd/credenshare-conformance@latest -v
+go run github.com/CredenShare/credenshare-sdk-go/cmd/credenshare-conformance@v0.1.0 -v
 ```
 
 Non-zero exit on failure, so it works as a deployment gate. The vectors include cases that
