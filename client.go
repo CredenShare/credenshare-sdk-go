@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,6 +39,10 @@ const (
 	// Idempotency-Key and the body are both identical on the second attempt — which is the
 	// entire reason the header is mandatory.
 	DefaultMaxRetries = 2
+
+	// DefaultTimeout applies to each attempt when Options.Timeout is zero and no HTTPClient
+	// with a timeout of its own is supplied.
+	DefaultTimeout = 30 * time.Second
 )
 
 // A Credential is a parsed API credential: crs_sk_live_<keyId>.<authSecret>[.<custodySecret>].
@@ -117,6 +120,26 @@ func (c *Credential) CustodyPublicKey() (string, error) {
 	return pair.PublicKeyB64URL, nil
 }
 
+// WrapToCustody wraps a payload to this credential's own custody public key.
+//
+// Done here rather than by handing the secret out: the custody secret is the one value the
+// server deliberately cannot hold, and an accessor is all it takes for it to reach a log.
+func (c *Credential) WrapToCustody(payload []byte) (string, error) {
+	if c.custodySecret == "" {
+		return "", fmt.Errorf(
+			"%w: custody needs a three-part credential "+
+				"'crs_sk_live_<keyId>.<authSecret>.<custodySecret>'; this one has two parts, "+
+				"so there is no custody key to wrap to",
+			ErrCredentialFormat,
+		)
+	}
+	pair, err := CustodyKeypair(c.custodySecret)
+	if err != nil {
+		return "", err
+	}
+	return WrapToPublicKey(payload, pair.PublicKeyRaw)
+}
+
 // String never renders the secrets. A credential in a log line is a credential that has to be
 // rotated, and %v on a struct is how that usually happens.
 func (c *Credential) String() string {
@@ -183,6 +206,19 @@ type CreateParams struct {
 	AccessCountsLeft int
 	TimedView        int
 
+	// Custody also wraps the content key to the custody public key derived from the
+	// credential's third part, so the share is readable from the dashboard later.
+	//
+	// Without it an API-created share is custody "none": the link is the only way back to the
+	// content, and losing it loses the secret. CustodyPublicKey exists to register that key,
+	// but until this flag there was no way to actually use it from a create.
+	Custody bool
+
+	// ItemKeyWrap is a wrap computed by the caller. Mutually exclusive with Custody.
+	ItemKeyWrap string
+
+	OrganizationID string
+
 	// IdempotencyKey is generated per call unless you set it. Setting your own does NOT make
 	// a second call a no-op: encryption is randomised per call, so the body differs and the
 	// API refuses with ErrIdempotencyConflict. That is the header working, not failing. What
@@ -199,8 +235,22 @@ type Options struct {
 	BaseURL    string
 	LinkOrigin string
 	HTTPClient *http.Client
-	MaxRetries int
+
+	// MaxRetries is a pointer so that 0 means "do not retry" rather than "unset".
+	// With a plain int the two are indistinguishable, and a caller who deliberately
+	// disabled retries silently got the default of 2 instead.
+	MaxRetries *int
+
+	// Timeout applies to each attempt. Zero uses DefaultTimeout. Ignored when HTTPClient
+	// is supplied with a timeout of its own.
+	Timeout time.Duration
 }
+
+// Retries returns a pointer to n, for setting Options.MaxRetries inline.
+//
+// Options.MaxRetries is a pointer so that Retries(0) genuinely disables retries; a plain
+// int cannot distinguish "zero" from "not set".
+func Retries(n int) *int { return &n }
 
 // A Client talks to the /v1 API.
 type Client struct {
@@ -225,21 +275,30 @@ func New(credential string, opts *Options) (*Client, error) {
 		opts = &Options{}
 	}
 
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+
 	client := &Client{
 		Credential: parsed,
 		baseURL:    strings.TrimRight(orDefault(opts.BaseURL, DefaultBaseURL), "/"),
 		linkOrigin: strings.TrimRight(orDefault(opts.LinkOrigin, DefaultLinkOrigin), "/"),
 		httpClient: opts.HTTPClient,
-		maxRetries: opts.MaxRetries,
+		maxRetries: DefaultMaxRetries,
+	}
+	if opts.MaxRetries != nil {
+		client.maxRetries = *opts.MaxRetries
+		if client.maxRetries < 0 {
+			client.maxRetries = 0
+		}
 	}
 	if client.httpClient == nil {
-		client.httpClient = &http.Client{Timeout: 30 * time.Second}
-	}
-	if opts.MaxRetries == 0 {
-		client.maxRetries = DefaultMaxRetries
-	}
-	if client.maxRetries < 0 {
-		client.maxRetries = 0
+		client.httpClient = &http.Client{Timeout: timeout}
+	} else if client.httpClient.Timeout == 0 && opts.Timeout > 0 {
+		// A supplied client with no timeout of its own would otherwise wait forever,
+		// which is the one thing a caller passing Timeout was trying to prevent.
+		client.httpClient.Timeout = timeout
 	}
 	return client, nil
 }
@@ -269,9 +328,10 @@ func (c *Client) LinkFor(shortCode string, contentKey []byte) (string, error) {
 // proof-of-work and captcha gates that protect it, and exposing it to a credential would be an
 // enumeration bypass. Open the link in a browser, or use DecryptContent on a blob you hold.
 func (c *Client) ReadLink(_ string) ([]Field, error) {
-	return nil, errors.New(
-		"the recipient read path is not exposed over the API by design; open the link in a " +
-			"browser, or use DecryptContent on a blob you already have",
+	return nil, fmt.Errorf(
+		"%w: the recipient read path is not exposed over the API by design; open the link "+
+			"in a browser, or use DecryptContent on a blob you already have",
+		ErrNotSupported,
 	)
 }
 
@@ -301,11 +361,27 @@ func (c *Client) CreateShare(ctx context.Context, params CreateParams) (*Share, 
 		return nil, err
 	}
 
+	itemKeyWrap := params.ItemKeyWrap
+	if params.Custody {
+		if itemKeyWrap != "" {
+			return nil, fmt.Errorf("%w: set either Custody or ItemKeyWrap, not both", ErrInvalidField)
+		}
+		if itemKeyWrap, err = c.Credential.WrapToCustody(contentKey); err != nil {
+			return nil, err
+		}
+	}
+
 	body := map[string]any{
 		"title":           params.Title,
 		"encryption_type": encryptionType,
 		"data":            blob,
 		"access_token":    token,
+	}
+	if itemKeyWrap != "" {
+		body["item_key_wrap"] = itemKeyWrap
+	}
+	if params.OrganizationID != "" {
+		body["organization_id"] = params.OrganizationID
 	}
 	if params.Description != "" {
 		body["description"] = params.Description
@@ -417,12 +493,30 @@ func (c *Client) IterateShares(ctx context.Context, limit int, fn func(ShareSumm
 		if err != nil {
 			return err
 		}
+		// The server echoes the page number, and HasMore compares that echo against
+		// TotalPages. A server that echoes a constant therefore either stops on page one or
+		// loops forever. Terminate on the counter this loop controls instead.
+		if batch.Page != page {
+			return fmt.Errorf(
+				"%w: asked for page %d and the API answered with page %d, so paging cannot "+
+					"be trusted to terminate", ErrAPI, page, batch.Page,
+			)
+		}
 		for _, share := range batch.Shares {
 			if err := fn(share); err != nil {
 				return err
 			}
 		}
-		if !batch.HasMore() {
+		if batch.TotalPages > 0 {
+			if page >= batch.TotalPages {
+				return nil
+			}
+			continue
+		}
+		// No TotalPages: keep going while pages come back full, and stop on the first short
+		// one. Treating an absent count as "no more" silently returns a fraction of the
+		// account as though it were all of it.
+		if len(batch.Shares) < limit {
 			return nil
 		}
 	}
@@ -520,9 +614,13 @@ func (c *Client) request(
 			// committed and this client cannot tell, so it is surfaced rather than repeated.
 			lastErr = err
 			if ctx.Err() != nil || attempt >= c.maxRetries {
+				// ErrServiceUnavailable is documented as "nothing was created", which is an
+				// answer from the API. Never reaching it is not that answer, and a caller
+				// who treats it as one retries a create with a fresh key and mints a second
+				// copy of the same secret.
 				return nil, fmt.Errorf(
 					"%w: could not reach the API after %d attempt(s): %v",
-					ErrServiceUnavailable, attempt+1, lastErr,
+					ErrDeliveryUnknown, attempt+1, lastErr,
 				)
 			}
 			// Plain exponential backoff, no jitter: the retry count is 2 by default, so a
@@ -590,6 +688,8 @@ func errorFor(response *http.Response, parsed map[string]any, raw []byte) error 
 	case http.StatusConflict:
 		if code == idempotencyConflictCode {
 			apiErr.kind = ErrIdempotencyConflict
+		} else {
+			apiErr.kind = ErrAPI
 		}
 	case http.StatusTooManyRequests:
 		apiErr.kind = ErrRateLimited
@@ -598,6 +698,11 @@ func errorFor(response *http.Response, parsed map[string]any, raw []byte) error 
 		}
 	case http.StatusServiceUnavailable:
 		apiErr.kind = ErrServiceUnavailable
+	default:
+		// Without this, a 400 or a 500 produced an APIError that errors.Is matched against
+		// nothing, so the documented "check the sentinel" pattern silently fell through for
+		// the two statuses a caller is most likely to hit.
+		apiErr.kind = ErrAPI
 	}
 	return apiErr
 }

@@ -87,7 +87,7 @@ func newTestClient(t *testing.T, rec *recorder, credential string) *Client {
 	client, err := New(credential, &Options{
 		LinkOrigin: "https://crs.sh",
 		HTTPClient: &http.Client{Transport: rec},
-		MaxRetries: 2,
+		MaxRetries: Retries(2),
 	})
 	if err != nil {
 		t.Fatalf("building the client: %v", err)
@@ -462,17 +462,25 @@ func TestAnHTTP500IsNotRetried(t *testing.T) {
 	}
 }
 
-func TestRetriesAreBoundedAndSurfaceAsUnavailable(t *testing.T) {
+// A transport failure is NOT ErrServiceUnavailable. That sentinel is documented as "nothing
+// was created", which is an answer from the API; never getting one is not that answer. Go's
+// Do returns once headers arrive, so a failure there can still mean the request was written
+// and processed - which is exactly why the honest sentinel is ErrDeliveryUnknown.
+func TestRetriesAreBoundedAndReportAnUnknownOutcome(t *testing.T) {
 	rec := &recorder{failures: 99}
 	client, err := New(testCredential, &Options{
 		HTTPClient: &http.Client{Transport: rec},
-		MaxRetries: 1,
+		MaxRetries: Retries(1),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.ListShares(context.Background(), 10, 1); !errors.Is(err, ErrServiceUnavailable) {
+	err = func() error { _, e := client.ListShares(context.Background(), 10, 1); return e }()
+	if !errors.Is(err, ErrDeliveryUnknown) {
 		t.Fatalf("got %v", err)
+	}
+	if errors.Is(err, ErrServiceUnavailable) {
+		t.Fatal("a transport failure must not claim the API said nothing was created")
 	}
 	if rec.attempts != 2 {
 		t.Fatalf("made %d attempts", rec.attempts)

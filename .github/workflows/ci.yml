@@ -96,8 +96,10 @@ jobs:
         # in normal use — it produces content that can never be decrypted, discovered by a
         # customer when a link does not open.
         #
-        # The URL is configuration rather than a constant because the specification lives in a
-        # private repository, so this needs a URL the runner can actually reach.
+        # The URL is configuration rather than a constant because there is no canonical
+        # public copy to hardcode: the specification and the vectors ship in this repository.
+        # Point the variable at one when a canonical copy exists - or at a candidate fixture
+        # on a branch, before publishing it.
         env:
           # Opt-in. This SDK is self-contained: the spec and the vectors both ship in
           # this repository, and the digest pin already catches a local edit. What

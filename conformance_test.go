@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -81,9 +82,25 @@ func TestTheEmbeddedFixtureMatchesThePublishedOne(t *testing.T) {
 		t.Fatalf("fetching the published fixture: %v", err)
 	}
 	defer response.Body.Close()
+	// Check the status BEFORE comparing bytes. A 404 body also "differs from the embedded
+	// fixture", and the message below would report that as drift and send a maintainer to
+	// overwrite a known-good fixture with an HTML error page.
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf(
+			"the published fixture is not reachable: %s returned HTTP %d. Drift is NOT "+
+				"being checked. Fix the URL - do not touch vectors.v1.json.",
+			url, response.StatusCode,
+		)
+	}
 	published, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Fatalf("reading the published fixture: %v", err)
+	}
+	if !json.Valid(published) {
+		t.Fatalf(
+			"the published fixture at %s is not JSON. Drift is NOT being checked. Fix the "+
+				"URL - do not touch vectors.v1.json.", url,
+		)
 	}
 	if !bytes.Equal(published, ConformanceVectorsJSON()) {
 		t.Fatal(

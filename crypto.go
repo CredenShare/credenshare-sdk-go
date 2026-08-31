@@ -20,6 +20,7 @@
 package credenshare
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -31,6 +32,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 )
 
@@ -45,6 +47,121 @@ type Field struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 	Type  string `json:"type"`
+
+	// Extra holds members this version does not know about, so that a field written by a
+	// newer sender survives being read and written again here.
+	//
+	// Without it the struct is closed: decoding drops anything unrecognised, and re-encrypting
+	// writes the field back with those members gone. Nothing errors, and the loss is invisible
+	// until whoever added the member wonders where it went.
+	//
+	// json.RawMessage rather than any, so the original bytes are preserved exactly instead of
+	// being round-tripped through float64 and reformatted.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// marshalNoEscapeHTML encodes v with HTML escaping off.
+//
+// The package-level json.Marshal escapes <, > and & even inside MarshalJSON output, which is
+// the divergence EncryptContent turns off for the outer document. Field's own marshaller has
+// to do the same or a field containing those characters is re-escaped on the way out.
+func marshalNoEscapeHTML(v any) ([]byte, error) {
+	var b strings.Builder
+	encoder := json.NewEncoder(&b)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(v); err != nil {
+		return nil, err
+	}
+	return []byte(strings.TrimSuffix(b.String(), "\n")), nil
+}
+
+// MarshalJSON writes key, value and type in that order, then any unknown members.
+//
+// Declaration order is the wire form, so it cannot be left to encoding/json's struct ordering
+// by accident — and unknown members are written after the three known ones, sorted, so the
+// output is deterministic for a given field.
+func (f Field) MarshalJSON() ([]byte, error) {
+	var out bytes.Buffer
+	out.WriteByte('{')
+
+	known := []struct {
+		name  string
+		value string
+	}{{"key", f.Key}, {"value", f.Value}, {"type", f.Type}}
+	for i, member := range known {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		name, err := marshalNoEscapeHTML(member.name)
+		if err != nil {
+			return nil, err
+		}
+		value, err := marshalNoEscapeHTML(member.value)
+		if err != nil {
+			return nil, err
+		}
+		out.Write(name)
+		out.WriteByte(':')
+		out.Write(value)
+	}
+
+	names := make([]string, 0, len(f.Extra))
+	for name := range f.Extra {
+		switch name {
+		case "key", "value", "type":
+			// A known member cannot also be an unknown one; the struct field wins.
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		encoded, err := marshalNoEscapeHTML(name)
+		if err != nil {
+			return nil, err
+		}
+		out.WriteByte(',')
+		out.Write(encoded)
+		out.WriteByte(':')
+		out.Write(f.Extra[name])
+	}
+
+	out.WriteByte('}')
+	return out.Bytes(), nil
+}
+
+// UnmarshalJSON keeps every member, known or not.
+func (f *Field) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*f = Field{}
+	for name, value := range raw {
+		switch name {
+		case "key":
+			if err := json.Unmarshal(value, &f.Key); err != nil {
+				return fmt.Errorf("field member 'key': %w", err)
+			}
+		case "value":
+			if err := json.Unmarshal(value, &f.Value); err != nil {
+				return fmt.Errorf("field member 'value': %w", err)
+			}
+		case "type":
+			if err := json.Unmarshal(value, &f.Type); err != nil {
+				return fmt.Errorf("field member 'type': %w", err)
+			}
+		default:
+			if f.Extra == nil {
+				f.Extra = make(map[string]json.RawMessage, len(raw))
+			}
+			kept := make(json.RawMessage, len(value))
+			copy(kept, value)
+			f.Extra[name] = kept
+		}
+	}
+	return nil
 }
 
 // Lengths are exact, per section 0. Named rather than inlined so a truncated blob is rejected
@@ -181,10 +298,10 @@ func contentCipher(contentKey, salt []byte, passcode *string) (cipher.AEAD, erro
 func ValidateFields(fields []Field) error {
 	for i, field := range fields {
 		if field.Key == "" {
-			return fmt.Errorf("field %d has no 'key' (its visible label)", i)
+			return fmt.Errorf("%w: field %d has no 'key' (its visible label)", ErrInvalidField, i)
 		}
 		if field.Type == "" {
-			return fmt.Errorf("field %d has no 'type'; one of %s", i, strings.Join(FieldTypes, ", "))
+			return fmt.Errorf("%w: field %d has no 'type'; one of %s", ErrInvalidField, i, strings.Join(FieldTypes, ", "))
 		}
 	}
 	return nil
@@ -240,7 +357,7 @@ func EncryptContent(contentKey []byte, fields []Field, opts ...EncryptOption) (s
 		return "", err
 	}
 
-	// encoding/json escapes <, > and & as <, > and & by default. The other
+	// encoding/json escapes <, > and & as \u003c, \u003e and \u0026 by default. The other
 	// implementations do not, so a field containing any of them would produce a different
 	// blob — decryptable here, byte-different from every other client, and caught only by the
 	// conformance vectors if they happened to contain one. Turning the escaping off makes the

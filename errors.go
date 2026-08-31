@@ -109,4 +109,25 @@ var (
 	// guessing "unlimited" would let an account exceed its plan and guessing "exhausted"
 	// would break a healthy one during a billing hiccup.
 	ErrServiceUnavailable = errors.New("the service could not resolve entitlements")
+
+	// ErrDeliveryUnknown means the request reached the API but its outcome could not be
+	// read. Distinct from ErrServiceUnavailable, which is an answer from the API saying
+	// nothing was created; here the bytes were delivered and the server may have
+	// committed. A CreateShare that returns this may have produced a share whose link
+	// this process never saw.
+	//
+	// Do not retry with a fresh Idempotency-Key: that is how one secret becomes two,
+	// each with its own link and audit trail. Repeat the identical request, or
+	// reconcile by listing before retrying.
+	ErrDeliveryUnknown = errors.New("the request was delivered and its outcome is unknown")
+
+	// ErrNotSupported marks an operation this SDK deliberately does not expose.
+	ErrNotSupported = errors.New("this operation is not exposed over the API by design")
+
+	// ErrInvalidField marks a field object that does not match the wire format.
+	ErrInvalidField = errors.New("a field is not valid")
+
+	// ErrAPI is the fallback for a refusal with no more specific sentinel, so that
+	// errors.Is(err, ErrAPI) matches every APIError rather than only some of them.
+	ErrAPI = errors.New("the API refused this request")
 )

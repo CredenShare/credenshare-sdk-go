@@ -207,11 +207,15 @@ self-consistency.
 
 ### One Go-specific trap, handled
 
-`encoding/json` escapes `<`, `>` and `&` as `<`, `>` and `&` by default. No other
-implementation escapes, so a field containing any of them would produce a blob this client can
-decrypt and no other client can reproduce. This SDK turns the escaping off. The conformance
-vectors do not happen to contain such a character, so a dedicated test asserts it — the vectors
-pass either way, which is exactly why the test exists.
+`encoding/json` escapes `<`, `>` and `&` as `<`, `>` and `&` by default. No
+other implementation escapes, so a field containing any of them would produce a blob this
+client can decrypt and no other client can reproduce. This SDK turns the escaping off — in
+`EncryptContent` and in `Field`'s own marshaller, since the package-level `json.Marshal`
+re-escapes `MarshalJSON` output otherwise.
+
+The conformance fixture now carries a case containing all three characters, so this is caught
+by the vectors rather than by folklore. A dedicated test asserts it as well, because the trap
+is silent: the blob decrypts perfectly here and nowhere else.
 
 ## Errors
 
@@ -227,7 +231,12 @@ Branch with `errors.Is`; reach the status and request id with `errors.As` to `*A
 | `ErrQuotaExceeded` | the plan's share allowance is spent | waiting does not help — expire old shares or change plan |
 | `ErrIdempotencyConflict` | a key was replayed with a different body | expected on a caller-level replay; see above |
 | `ErrRateLimited` | too many requests | wait `APIError.RetryAfter` seconds |
-| `ErrServiceUnavailable` | entitlements could not be resolved | nothing was created; retry |
+| `ErrServiceUnavailable` | a real HTTP 503; entitlements could not be resolved | nothing was created; retry |
+| `ErrDeliveryUnknown` | delivered, but no response was read | it may have committed. Repeat the identical request — a fresh key here is how one secret becomes two |
+| `ErrNotFound` | no such share, or not yours | a code from another account reads exactly like one that never existed |
+| `ErrInvalidField` | a field is not `{Key, Value, Type}` | `Key` is the visible label — not "label", "name" or "title" |
+| `ErrNotSupported` | the operation is deliberately absent | `ReadLink` — open the link in a browser instead |
+| `ErrAPI` | any other refusal | the fallback, so `errors.Is(err, ErrAPI)` matches every `APIError` |
 
 ## Licence
 

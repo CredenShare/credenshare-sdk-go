@@ -31,9 +31,17 @@ const DefaultTolerance = 5 * time.Minute
 // error; the wrapped message says which check failed.
 var ErrVerification = errors.New("the webhook delivery did not verify")
 
+// NoTolerance is a convenience for Options.Tolerance meaning "the timestamp must be exact".
+func NoTolerance() *time.Duration { return new(time.Duration) }
+
+// ToleranceOf returns a pointer to d, for setting Options.Tolerance inline.
+func ToleranceOf(d time.Duration) *time.Duration { return &d }
+
 // Options tune verification. The zero value uses DefaultTolerance and the current clock.
 type Options struct {
-	Tolerance time.Duration
+	// Tolerance is a pointer so that a zero Duration means "accept no drift" rather than
+	// "unset". Use NoTolerance for the strict case.
+	Tolerance *time.Duration
 	// Now is for tests. Zero means time.Now().
 	Now time.Time
 }
@@ -71,9 +79,12 @@ func Verify(payload []byte, header string, secrets []string, opts *Options) erro
 	if opts == nil {
 		opts = &Options{}
 	}
-	tolerance := opts.Tolerance
-	if tolerance == 0 {
-		tolerance = DefaultTolerance
+	// A pointer so that 0 means "accept no drift at all" rather than "unset". With a
+	// plain Duration the two are indistinguishable, so a caller pinning the clock in a
+	// test silently got the five-minute default and the test proved nothing.
+	tolerance := DefaultTolerance
+	if opts.Tolerance != nil {
+		tolerance = *opts.Tolerance
 	}
 	now := opts.Now
 	if now.IsZero() {
