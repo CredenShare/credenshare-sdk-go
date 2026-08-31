@@ -5,7 +5,7 @@ never reaches CredenShare, which is what makes "we cannot read your data" a prop
 system rather than a promise.
 
 ```bash
-go get github.com/CredenShare/credenshare-sdk-go@v0.1.3
+go get github.com/CredenShare/credenshare-sdk-go
 ```
 
 ```go
@@ -202,7 +202,7 @@ The vectors are embedded with `go:embed`, so they travel with the binary and can
 in a container that shipped only the executable:
 
 ```bash
-go run github.com/CredenShare/credenshare-sdk-go/cmd/credenshare-conformance@v0.1.3 -v
+go run github.com/CredenShare/credenshare-sdk-go/cmd/credenshare-conformance@v0.1.4 -v
 ```
 
 Non-zero exit on failure, so it works as a deployment gate. The vectors include cases that
