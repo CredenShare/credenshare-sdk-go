@@ -214,9 +214,15 @@ self-consistency.
 
 `encoding/json` escapes `<`, `>` and `&` as `\u003c`, `\u003e` and `\u0026` by default. No
 other implementation escapes, so a field containing any of them would produce a blob this
-client can decrypt and no other client can reproduce. This SDK turns the escaping off — in
-`EncryptContent` and in `Field`'s own marshaller, since the package-level `json.Marshal`
-re-escapes `MarshalJSON` output otherwise.
+client can decrypt and no other client can reproduce. This SDK turns the escaping off in both
+places it matters: `EncryptContent`, and `Field`'s own marshaller.
+
+The inner one is the load-bearing call, and not for the reason you might expect.
+`encoding/json`'s compact pass never *unescapes*, so an escape written by `Field.MarshalJSON`
+survives `EncryptContent`'s `SetEscapeHTML(false)` untouched — the outer setting cannot undo an
+inner escape. (Calling the package-level `json.Marshal` on a `Field` directly does still
+escape, since that compacts with escaping on. It does not affect the wire format, which only
+ever goes through `EncryptContent`.)
 
 The conformance fixture now carries a case containing all three characters, so this is caught
 by the vectors rather than by folklore. A dedicated test asserts it as well, because the trap

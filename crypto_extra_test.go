@@ -68,20 +68,34 @@ func TestAFieldWithNoExtrasIsUnchanged(t *testing.T) {
 	}
 }
 
-// EncryptContent turns HTML escaping off; Field's own marshaller must not turn it back on.
+// Field's own marshaller must not escape, because the outer encoder cannot undo it.
+//
+// The first version of this test round-tripped through EncryptContent/DecryptContent and
+// asserted the Key came back intact. That assertion is blind to the thing it is named for:
+// json.Unmarshal turns < back into <, so it passed identically with escaping ON. The
+// bytes MarshalJSON produces are what another implementation has to reproduce, so assert on
+// those.
 func TestFieldMarshallingDoesNotEscapeHTML(t *testing.T) {
-	blob, err := EncryptContent(
-		make([]byte, 32),
-		[]Field{{Key: "a<b>c&d", Value: "v", Type: "text"}},
-	)
+	field := Field{Key: "a<b>c&d", Value: "a > b && c < d", Type: "text"}
+
+	encoded, err := field.MarshalJSON()
 	if err != nil {
 		t.Fatal(err)
 	}
-	fields, err := DecryptContent(make([]byte, 32), blob, nil)
-	if err != nil {
-		t.Fatal(err)
+	got := string(encoded)
+
+	for _, escaped := range []string{`\u003c`, `\u003e`, `\u0026`} {
+		if strings.Contains(got, escaped) {
+			t.Fatalf("MarshalJSON escaped HTML (%s): %s", escaped, got)
+		}
 	}
-	if fields[0].Key != "a<b>c&d" {
-		t.Fatalf("key round-tripped as %q", fields[0].Key)
+	for _, raw := range []string{"a<b>c&d", "a > b && c < d"} {
+		if !strings.Contains(got, raw) {
+			t.Fatalf("MarshalJSON did not emit %q verbatim: %s", raw, got)
+		}
 	}
+
+	// The wire-plaintext half of this - that the same bytes survive EncryptContent's outer
+	// encoder - is asserted by TestHtmlEscapableCharactersSurviveUnescaped in
+	// conformance_test.go, which opens the blob by hand. Not duplicated here.
 }

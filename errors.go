@@ -65,10 +65,20 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("%s (%s)", e.Message, parts)
 }
 
-// Unwrap exposes the sentinel so errors.Is works:
+// Unwrap exposes the specific sentinel so errors.Is works:
 //
 //	if errors.Is(err, credenshare.ErrQuotaExceeded) { ... }
 func (e *APIError) Unwrap() error { return e.kind }
+
+// Is makes ErrAPI the catch-all it is documented to be.
+//
+// Unwrap alone only ever yields the SPECIFIC sentinel, so errors.Is(err, ErrAPI) matched
+// exactly those refusals whose kind happened to be ErrAPI - four of the ten shapes - while
+// errors.go and the README both told callers it matched every *APIError. A caller using it
+// as the fallback arm of a type switch silently skipped 401, 403, 404, 429 and 503.
+//
+// The specific sentinels keep matching through Unwrap; this only widens the catch-all.
+func (e *APIError) Is(target error) bool { return target == ErrAPI }
 
 // The sentinels an APIError wraps. Each names a remedy, not just a status.
 var (

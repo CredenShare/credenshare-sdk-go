@@ -141,8 +141,11 @@ func TestJSONHTMLEscapingIsOff(t *testing.T) {
 	// default. No other
 	// implementation does, so a field containing any of them would produce a blob this client
 	// can decrypt and no other client can reproduce - a difference invisible until two people
-	// using different SDKs compare notes. The conformance vectors do not happen to contain one
-	// of those characters, so this asserts it directly rather than relying on them.
+	// using different SDKs compare notes. The conformance vectors DO cover these characters,
+	// so this is not the only thing standing between us and the trap. It exists because it
+	// checks a different layer: the vectors compare a finished blob, while this opens the
+	// blob and looks at the wire plaintext, which is the thing another implementation has to
+	// reproduce byte for byte.
 	//
 	// Decrypting the blob is not enough: an escaped blob decrypts here too, and json.Unmarshal
 	// turns the escapes back into the original characters. The WIRE PLAINTEXT is what another

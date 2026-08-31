@@ -51,6 +51,12 @@ type Field struct {
 	// Extra holds members this version does not know about, so that a field written by a
 	// newer sender survives being read and written again here.
 	//
+	// BREAKING, from the commit that added it: a struct containing a map is not comparable,
+	// so `f1 == f2` no longer compiles and Field can no longer be a map key. Use
+	// [Field.Equal] for value equality, and key maps on Field.Key instead. The alternative
+	// was to keep dropping unknown members on every decrypt/re-encrypt round trip, which
+	// loses data silently - a worse failure than a compile error that names itself.
+	//
 	// Without it the struct is closed: decoding drops anything unrecognised, and re-encrypting
 	// writes the field back with those members gone. Nothing errors, and the loss is invisible
 	// until whoever added the member wonders where it went.
@@ -62,9 +68,18 @@ type Field struct {
 
 // marshalNoEscapeHTML encodes v with HTML escaping off.
 //
-// The package-level json.Marshal escapes <, > and & even inside MarshalJSON output, which is
-// the divergence EncryptContent turns off for the outer document. Field's own marshaller has
-// to do the same or a field containing those characters is re-escaped on the way out.
+// This is load-bearing, but not for the reason first written here. The claim was that the
+// outer encoder re-escapes MarshalJSON output; what actually happens is the reverse and it
+// is worse. encoding/json's compact pass never UNESCAPES, so an escape written HERE survives
+// EncryptContent's outer SetEscapeHTML(false) untouched: the outer setting cannot undo an
+// inner escape. Leave escaping on in this function and every field containing <, > or & goes
+// on the wire as \u003c, \u003e, \u0026 - decryptable by this client and byte-different
+// from every other implementation, which is the exact divergence the outer call exists to
+// prevent.
+//
+// (The package-level json.Marshal does still escape a Field, since it compacts with escaping
+// ON. That affects anyone calling json.Marshal(field) directly, not the wire format, which
+// only ever goes through EncryptContent.)
 func marshalNoEscapeHTML(v any) ([]byte, error) {
 	var b strings.Builder
 	encoder := json.NewEncoder(&b)
@@ -73,6 +88,28 @@ func marshalNoEscapeHTML(v any) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(strings.TrimSuffix(b.String(), "\n")), nil
+}
+
+// Equal reports whether two fields carry the same members and values.
+//
+// The replacement for `==`, which stopped compiling when Extra made Field non-comparable.
+// Extra values are compared as raw bytes, so two fields whose unknown members differ only in
+// JSON whitespace compare unequal - that is deliberate, since this type exists to preserve
+// bytes it does not understand.
+func (f Field) Equal(other Field) bool {
+	if f.Key != other.Key || f.Value != other.Value || f.Type != other.Type {
+		return false
+	}
+	if len(f.Extra) != len(other.Extra) {
+		return false
+	}
+	for name, value := range f.Extra {
+		otherValue, ok := other.Extra[name]
+		if !ok || !bytes.Equal(value, otherValue) {
+			return false
+		}
+	}
+	return true
 }
 
 // MarshalJSON writes key, value and type in that order, then any unknown members.
