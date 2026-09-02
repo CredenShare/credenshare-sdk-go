@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.2.0 — 2026-09-02
+
+The secure-request surface: a keyless collect link, the sealed submissions to it, and the
+32-byte seed that is the only thing able to read them. Plus `GetStats`.
+
+Additive — nothing on the already-published shares surface changed shape or behaviour — so
+this is a minor bump. The names below were settled ACROSS the four SDKs before any of them
+published this surface, because a name in a Go module's import path cannot be renamed after a
+tag exists.
+
+### Added
+
+- **`CreateRequest`, `ListRequests`, `IterateRequests`, `GetRequest`, `DeleteRequest`,
+  `ListSubmissions`, `IterateSubmissions`** and the types they carry: `SecureRequest`,
+  `RequestSummary`, `RequestPage`, `RequestDeletion`, `RequestField`, `Submission`,
+  `SubmissionPage`, `CreateRequestParams`.
+- **`GetStats`**, with `Stats`, `ShareCounts` and `DailyView`. The counts are nested —
+  `stats.Shares.Active` — matching the API, the specification and the sibling SDKs.
+- **`DecryptSubmission(data, seed)`** and **`Submission.Decrypt(seed)`**. The blob comes
+  first and the key second, the same order as the other three SDKs.
+- **`CollectLinkFor(shortCode)`** and **`AccessLinkFor(shortCode, seed)`** on the client, plus
+  `SecureRequest.CollectLink` and `SecureRequest.AccessLink`. Neither link is derivable from
+  an API response: the `/r/` segment and the origin belong to the application, and the access
+  fragment is version-prefixed, which is the part a hand-assembled link gets wrong.
+- **`SeedLength`** (32), so a caller validating a stored seed does not have to write the
+  literal.
+- **`Client.Do` and `Call`**, the escape hatch for an endpoint this SDK does not wrap, with the
+  same authentication, retries, error mapping and custody-secret boundary check as every typed
+  method. A `POST`, `PUT` or `PATCH` made through it is given an `Idempotency-Key` when
+  `Call.Headers` does not carry one — those three and **not** every non-GET. A `GET` and a
+  `DELETE` are given none: neither endpoint reads the header, a repeated delete is idempotent
+  by construction, and `ExpireShare`'s `DELETE /shares/{code}` has published those bytes since
+  0.1.4, so adding an inert header to them would be a wire change this release has no reason
+  to make. A key the CALLER supplies is forwarded on any method, `DELETE` included, exactly as
+  written.
+- **`ErrRequestSeedTransmitted`**, raised by a boundary assertion in `CreateRequest`: the
+  serialized body AND the outgoing `Idempotency-Key` are scanned for the seed as unpadded
+  base64url, as standard base64 and as hex, and a match refuses the call rather than sending
+  it. The header is covered because it is caller-supplied and leaves the machine — a
+  deterministic key derived from a deterministic seed would otherwise carry the seed out past
+  a check that only read the body.
+- A wrong-length `CreateRequestParams.Seed` is now `ErrMalformedKey`, raised before the
+  keypair is derived, rather than whatever the crypto primitive underneath returns.
+
+### Security
+
+- **`SecureRequest` withholds its seed and its access link from every reflexive
+  serialization path**, not only from `fmt`. `MarshalJSON` and `slog.LogValue` are new here
+  and both were leaks in the working tree: `json.Marshal` rendered the seed as base64 in full,
+  and a `slog` JSON handler wrote it into the log line, because neither consults `String`. All
+  four accessors — `String`, `GoString`, `MarshalJSON`, `LogValue` — take **value receivers**,
+  so a dereferenced or copied value redacts too; a pointer receiver would have left
+  `fmt.Sprintf("%+v", *created)` printing the seed while the same verb on the pointer looked
+  clean. The collect link is deliberately kept: it is not a secret.
+- **`CreateRequestParams` withholds its seed and its passcode from the same four paths**, on
+  value receivers for the same reason. This is the wider window of the two: the seed is in the
+  params BEFORE the call that returns it, so `fmt.Sprintf("%+v", params)` printed the 32 bytes,
+  `%#v` printed them as `[]uint8{...}`, `json.Marshal` emitted `"Seed":"<base64>"` and an
+  `slog` JSON handler wrote the same into the line — all of it upstream of a `SecureRequest`
+  that redacts perfectly. The passcode goes with it: it is transmitted, but it is a value the
+  caller chose and may have reused elsewhere. `MarshalJSON` here is deliberately lossy and is
+  NOT the create body — that body is assembled member by member inside `CreateRequest`, which
+  a test now asserts.
+- **`SeedKeypair` withholds its seed, its scalar and its private key** from `String`,
+  `GoString`, `MarshalJSON` and `slog.LogValue`, again on value receivers, since
+  `KeypairFromSeed` returns a pointer and it is the dereferenced value that a pointer receiver
+  would have missed. Three of its five members are the private key in different clothes, and
+  one of them made a plain `%v` dangerous on its own: `Scalar` is a `*big.Int`, which is a
+  `Stringer`, so the private scalar printed in decimal with no verbose verb involved. The
+  public half is kept in every rendering, because a redaction that removes the identity is not
+  usable by whoever is reading the log.
+
+### Fixed, before 0.2.0 was published
+
+None of these ever shipped, so nothing in the wild breaks. They are recorded because the
+repository is public and somebody may have pinned to a commit from the window before the tag.
+
+- **Submissions are no longer paged.** The deployed endpoint reads neither `page` nor `limit`
+  and answers with every client-encrypted row plus a `count`, so `ListSubmissions` takes only
+  a short code and `IterateSubmissions` makes exactly one HTTP call. Paging it would have
+  re-requested and re-yielded the same rows.
+- `SubmissionPage` exposes the API's own `Count` as its own member rather than folding it into
+  a `Total` that a pagination block never sent.
+- `Submission` no longer carries an `ExpiredAt`. The endpoint sends `short_code`,
+  `created_at`, `data` and `encryption_type`; a member that is always nil reads as a broken
+  field rather than as an absent one. (The specification documents the field and is wrong.)
+- `DeleteRequest` returns `*RequestDeletion` rather than a bare outcome string, and an outcome
+  the API did not send stays empty rather than being reported as `"expired"`.
+- The request-field validator is unexported. The share-side `ValidateFields` stays public;
+  a request's prompts are checked on the one path that sends them.
+- **`SecureRequest.PublicKey` is the API's echo**, with the locally derived key as the
+  fallback, matching Node and Rust. It was set from the local derivation unconditionally,
+  which made the member's own documented use — quoting it against `GetRequest`'s copy — a
+  comparison of a local value with itself. A blank echo counts as no echo and takes the
+  fallback, so the member is still never empty on a successful create.
+- **`SubmissionPage.Count` is no longer backfilled from `len(Submissions)`.** Node, Python and
+  Rust all leave it absent when the server omits it, precisely so that a count disagreeing
+  with the number of rows is visible; the fallback made the two agree by construction and
+  erased the one signal the member exists to carry. Go has no absent `int`, so an omitted
+  count now reads as zero.
+- **`RequestPage.HasMore` climbs the same three rungs as the other three SDKs** —
+  `TotalPages`, then `Total`, then "a full page probably has a successor" — instead of
+  answering only from `TotalPages`. One rung reports "no more" on a FULL page whenever the
+  server omits the pagination block, which is how a walk returns a fraction of an account and
+  says nothing. The two lower rungs are guarded on `Limit > 0`: a server echoing `"limit": 0`
+  is believed, and `0 < Total` is true on every page including empty ones, which would convert
+  the truncation into an unbounded run of requests — the failure Node hit and fixed.
+  `SharePage.HasMore` is deliberately left alone: it shipped at 0.1.4, so its behaviour is not
+  this release's to change, and `IterateShares` already carries the equivalent fallback inside
+  the walk itself.
+
+### Documentation
+
+- The secure-requests section of the README states the two-encoding trap, the seed-redaction
+  guarantee and what the boundary assertion actually covers.
+- The README's redaction paragraph now covers `CreateRequestParams` and `SeedKeypair` as well
+  as `SecureRequest`, and names the `*big.Int` `Stringer` that made a plain `%v` dangerous.
+- "Idempotency and retries" says POST/PUT/PATCH rather than "every non-GET", and states why a
+  `GET` and a `DELETE` are given nothing.
+- The `PublicKey` echo and the un-backfilled `Count` are both stated where the surface is
+  described, because both are members whose value a caller is meant to compare against
+  something else.
+- The conformance one-liner names `v0.2.0`.
+
+
 ## 0.1.4 — released 2026-08-30
 
 The first version whose install instructions are the registry ones, because 0.1.3 is on the

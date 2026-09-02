@@ -103,6 +103,122 @@ There is deliberately **no method to read a share over the API**. The recipient 
 protected by proof-of-work and captcha gates that bearer auth skips, so exposing it to a
 credential would be an enumeration bypass. Open the link in a browser.
 
+## Secure requests
+
+A share hands a secret out. A **request** collects one in, from someone who needs no account
+and no key of their own.
+
+```go
+created, err := client.CreateRequest(ctx, credenshare.CreateRequestParams{
+    Title: "New starter credentials",
+    Fields: []credenshare.RequestField{
+        {Item: "Staging database password", Type: "password"},
+        {Item: "VPN certificate", Type: "multiline"},
+    },
+})
+
+// KEEP THIS. It is the only way to read the submissions.
+seed := created.Seed
+
+fmt.Println(created.CollectLink)
+// https://crs.sh/r/aB3dEf12 — hand this to a human; holding it lets them submit, never read.
+// created.AccessLink is the same link with the seed in its fragment. It IS the read
+// capability, so treat it as the secret rather than as a convenience.
+```
+
+`CreateRequest` generates the keypair **here** and sends only the public half. The 32-byte
+seed comes back in `SecureRequest.Seed` and is never transmitted — which is what lets us hand
+you submissions we cannot read. Lose it and they are unrecoverable, by you and by us; there is
+no reissue.
+
+That the seed is never transmitted is **asserted, not assumed**: before anything is sent, the
+serialized body and the outgoing `Idempotency-Key` are both scanned for it as unpadded
+base64url, as standard base64 (padded or not) and as hex, and a match is
+`ErrRequestSeedTransmitted` rather than a request. So an `IdempotencyKey` derived from the
+seed is refused, and so is a seed pasted into a title or a prompt.
+
+`SecureRequest` withholds the seed and the access link from **every** representation Go
+reaches for — `String`, `GoString`, `MarshalJSON` and `slog.LogValue` — because `%v` is not
+the only way a secret reaches a log: `json.Marshal` serializes an exported `[]byte` as base64
+with nothing looking wrong, and `slog` with a JSON handler resolves the field itself without
+consulting `String`. The collect link is kept, because it is not a secret. All four accessors
+take a **value receiver**, so a dereferenced or copied `SecureRequest` redacts too.
+
+`CreateRequestParams` carries the same four, and that window is the wider one: the seed is in
+the params you pass **in**, before the call that hands it back, so a `%+v` of what you are
+about to send used to print exactly what a `%+v` of the result does not. Its `Passcode` is
+withheld with the seed — it *is* transmitted, but it is a value you chose and may have reused.
+`SeedKeypair` carries them too, and there three of the five members are the private key in
+different clothes: `Scalar` is a `*big.Int`, which is itself a `Stringer`, so a plain `%v`
+printed the private scalar in decimal without anybody asking for a verbose verb.
+
+Both links are also available for a request you already hold: `client.CollectLinkFor(code)`
+and `client.AccessLinkFor(code, seed)`. Neither is derivable from an API response — the `/r/`
+segment and the origin are the application's, and the access fragment is version-prefixed
+(`#1` + unpadded base64url), which is exactly the part a hand-assembled link gets wrong.
+
+Pass `CreateRequestParams.Seed` to create under a keypair you already hold — it must be
+`credenshare.SeedLength` bytes, and a wrong length is `ErrMalformedKey` before any crypto
+runs. That is the custody-derived case: take the seed from `CustodyKeypair` and an ephemeral
+runner rebuilds the same read capability with no local state.
+
+```go
+page, err := client.ListSubmissions(ctx, created.ShortCode)
+for _, submission := range page.Submissions {
+    // or credenshare.DecryptSubmission(submission.Data, seed) — blob first, then the key
+    fields, err := submission.Decrypt(seed)
+    ...
+}
+
+err = client.IterateRequests(ctx, 100, func(r credenshare.RequestSummary) error { ... })
+err = client.IterateSubmissions(ctx, created.ShortCode, func(s credenshare.Submission) error { ... })
+```
+
+`ListSubmissions` takes **no page and no limit**, because the endpoint takes none: it answers
+with every client-encrypted row and a `Count`. That `Count` is the API's own figure and is
+**not** backfilled from `len(page.Submissions)` when a response omits it — it stays zero. The
+two exist to be compared, and reconciling them here would erase the only signal that the
+server's count and its payload disagree. A client that asked for a second page would be
+handed the first one again, so this one does not offer the option — `IterateSubmissions` is
+one HTTP call with a callback, not a walk. `ListRequests` **is** paged, and its limit defaults
+to 25, the API's own default for every v1 list.
+
+Listing returns the blobs **sealed**; nothing decrypts until you say so, so a caller counting
+submissions never holds the plaintext. `SubmissionPage.SkippedNotEndToEndEncrypted` counts
+submissions the API withheld because it could read them itself — legacy rows it will not
+serve over a credential. It is reported rather than swallowed so a short answer is never a
+mystery.
+
+`SecureRequest.PublicKey` is the API's **echo** of the key that was registered, falling back
+to the locally derived value when a response carries none — so it is never empty on a
+successful create. It is the value to quote when reconciling against `GetRequest`, and filled
+in from our own keypair on both sides that comparison could only ever agree with itself.
+
+Two encodings, one feature: a request's `public_key` travels as **unpadded base64url** and a
+submission's blob comes back as **padded standard base64**. Hand a blob to `Decrypt`
+verbatim; normalising it to the other alphabet produces something that will not open.
+
+`DeleteRequest` is **two-step**, and the `RequestDeletion` it returns says which step it took:
+`Outcome` is `"expired"` on an active request — new submissions stop, the ones received are
+preserved — and `"deleted"` when called again on an already-expired one. One call does not
+remove the request. An **empty** `Outcome` means the API did not say, and is deliberately not
+reported as either: do not retry to find out, because the second call deletes what the first
+one expired.
+
+## Stats
+
+```go
+stats, err := client.GetStats(ctx)
+fmt.Println(stats.Shares.Active, stats.Shares.Expired, stats.Shares.TotalViewed)
+for _, day := range stats.DailyViews {   // oldest first, zero-filled
+    fmt.Println(day.Date, day.Count)
+}
+```
+
+Cheaper than paging the share list to count. The per-member breakdown the dashboard shows is
+deliberately absent from the API: a credential scoped to read statistics should not become a
+way to enumerate colleagues.
+
 ## Idempotency and retries
 
 Every create carries an `Idempotency-Key`. It exists so a **network** retry cannot leave a
@@ -116,6 +232,32 @@ is the header working, not failing.
 
 Only network failures are retried. A 5xx is surfaced, because it may have committed and this
 client cannot tell.
+
+A **`POST`, `PUT` or `PATCH`** gets an `Idempotency-Key` whether or not the method that built
+it remembered one, generated once per call and repeated across this client's retries. A key
+you supplied is never overwritten, whatever its capitalisation, and it is forwarded on **any**
+method — you may be reproducing it yourself on retry, which is the only thing the header
+protects.
+
+A `GET` and a `DELETE` are given nothing. Neither endpoint reads the header; a repeated delete
+is idempotent by construction, because the row is gone either way; and `ExpireShare`'s
+`DELETE /shares/{code}` has sent those exact bytes since 0.1.4, which a minor release does not
+get to change in exchange for an inert header.
+
+That backstop also covers `Client.Do`, the escape hatch for an endpoint this SDK does not
+wrap:
+
+```go
+body, err := client.Do(ctx, credenshare.Call{
+    Method: http.MethodPost,
+    Path:   "/some-new-endpoint",
+    Body:   map[string]any{"a": 1},
+})
+```
+
+`Do` gets the same authentication, retries, error mapping and custody-secret boundary check as
+every typed method, and widens nothing: the same bearer token and scopes decide what it may
+reach.
 
 ---
 
@@ -202,7 +344,7 @@ The vectors are embedded with `go:embed`, so they travel with the binary and can
 in a container that shipped only the executable:
 
 ```bash
-go run github.com/CredenShare/credenshare-sdk-go/cmd/credenshare-conformance@v0.1.4 -v
+go run github.com/CredenShare/credenshare-sdk-go/cmd/credenshare-conformance@v0.2.0 -v
 ```
 
 Non-zero exit on failure, so it works as a deployment gate. The vectors include cases that
@@ -247,6 +389,8 @@ Branch with `errors.Is`; reach the status and request id with `errors.As` to `*A
 | `ErrNotFound` | no such share, or not yours | a code from another account reads exactly like one that never existed |
 | `ErrInvalidField` | a field is not `{Key, Value, Type}` | `Key` is the visible label — not "label", "name" or "title" |
 | `ErrNotSupported` | the operation is deliberately absent | `ReadLink` — open the link in a browser instead |
+| `ErrCustodySecretTransmitted` | the custody secret was about to be sent | rotate the credential; the zero-knowledge property is gone once it reaches the wire |
+| `ErrRequestSeedTransmitted` | a request seed was about to be sent | expire the request and create a new one — do not retry |
 | `ErrAPI` | any other refusal | the fallback, so `errors.Is(err, ErrAPI)` matches every `APIError` |
 
 ## Licence

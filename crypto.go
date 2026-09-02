@@ -31,6 +31,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"sort"
 	"strings"
@@ -207,7 +208,7 @@ const (
 	saltLen     = 16
 	ivLen       = 12
 	tagLen      = 16
-	keyLen      = 32
+	keyLen      = SeedLength
 	pubKeyLen   = 65 // 0x04 || X(32) || Y(32)
 	wrapVersion = 1
 )
@@ -260,6 +261,29 @@ func NewContentKey() ([]byte, error) {
 		return nil, fmt.Errorf("generating a content key: %w", err)
 	}
 	return key, nil
+}
+
+// SeedLength is the exact byte length of a secure request's seed.
+//
+// Exported because a caller who stores a seed has to validate it on the way back in, and the
+// alternative is a literal 32 in their code that nothing here would ever correct. The same
+// figure the wire specification fixes for a content key — keyLen above is defined FROM this
+// one so the two cannot drift — kept under its own name so that a seed and a content key
+// remain separate ideas at a call site.
+const SeedLength = 32
+
+// NewSeed returns a fresh 32-byte keypair seed from the OS CSPRNG.
+//
+// The same quantity of randomness as a content key, and a separate function on purpose: a
+// seed reconstructs a P-256 keypair (section 3) and a content key encrypts content (section
+// 2). One function serving both invites a caller to hand the wrong secret to the wrong
+// primitive, which fails as "cannot decrypt" a long way from the mistake.
+func NewSeed() ([]byte, error) {
+	seed := make([]byte, keyLen)
+	if _, err := rand.Read(seed); err != nil {
+		return nil, fmt.Errorf("generating a seed: %w", err)
+	}
+	return seed, nil
 }
 
 // EncodeFragment encodes a content key as a URL fragment: "1" + base64url(key).
@@ -487,12 +511,88 @@ func PasscodeVerifier(passcode string) (string, error) {
 //
 // Storing the seed rather than a serialized key is what lets an entire private key live in a
 // URL fragment, and what lets ephemeral automation derive the same key with no local state.
+//
+// Three of its five members are the private key in different clothes — the seed it was derived
+// from, the scalar itself, and the *ecdh.PrivateKey — so every representation Go reaches for
+// reflexively is redacted: String, GoString, MarshalJSON and slog.LogValue. See the methods
+// below. Read the private half through the members on purpose, or through PrivateKey.ECDH; do
+// not read it out of a log line.
 type SeedKeypair struct {
 	Seed            []byte
 	Scalar          *big.Int
 	PrivateKey      *ecdh.PrivateKey
 	PublicKeyRaw    []byte
 	PublicKeyB64URL string
+}
+
+// secretState says whether a withheld member was populated, without saying what it held.
+//
+// One helper, shared with CreateRequestParams in requests.go, so that String, GoString,
+// MarshalJSON and LogValue cannot drift into disagreeing about what they redact. Whether a
+// seed was supplied is usually the thing being debugged and is safe to print; its bytes never
+// are.
+func secretState(set bool) string {
+	if set {
+		return "[redacted]"
+	}
+	return "[unset]"
+}
+
+// String withholds the seed, the scalar and the private key, and prints the public half.
+//
+// %v on a struct is how a private key usually reaches a log, and this struct is worse than
+// most: Scalar is a *big.Int, which is itself a Stringer, so plain %v printed the private
+// scalar in decimal without anybody having asked for a verbose verb.
+//
+// A VALUE receiver, not a pointer one: a pointer method is absent from a dereferenced or
+// copied value's method set, so %+v of *keypair would print the seed in full while the same
+// verb on the pointer KeypairFromSeed returns looked clean.
+func (k SeedKeypair) String() string {
+	return fmt.Sprintf(
+		"<SeedKeypair public %s (seed, scalar and private key withheld)>", k.PublicKeyB64URL,
+	)
+}
+
+// GoString covers %#v, which would otherwise print the seed as []uint8{...}.
+func (k SeedKeypair) GoString() string { return k.String() }
+
+// MarshalJSON withholds the seed, the scalar and the private key.
+//
+// encoding/json is the path a struct most often leaves a process by — a state file, an audit
+// record, a queue message — and an exported []byte serializes as base64 with nothing about the
+// call site looking wrong.
+//
+// Deliberately lossy: the result does not unmarshal back into a usable keypair, which is the
+// point. Persist the seed yourself, on purpose, somewhere you chose, and derive the keypair
+// again with KeypairFromSeed. PublicKeyRaw is omitted because PublicKeyB64URL is the same 65
+// bytes in the encoding the API and the links use.
+func (k SeedKeypair) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		PublicKeyB64URL string `json:"public_key_b64url"`
+		Seed            string `json:"seed"`
+		Scalar          string `json:"scalar"`
+		PrivateKey      string `json:"private_key"`
+	}{
+		PublicKeyB64URL: k.PublicKeyB64URL,
+		Seed:            secretState(len(k.Seed) > 0),
+		Scalar:          secretState(k.Scalar != nil),
+		PrivateKey:      secretState(k.PrivateKey != nil),
+	})
+}
+
+// LogValue withholds the private halves from log/slog.
+//
+// slog consults neither String nor MarshalJSON on its own terms: a JSON handler handed this
+// struct resolves the []byte itself and writes the seed into the log line. This is the
+// interface that stops it, and it is why passing a keypair to slog.Info is safe rather than
+// merely discouraged.
+func (k SeedKeypair) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("public_key_b64url", k.PublicKeyB64URL),
+		slog.String("seed", secretState(len(k.Seed) > 0)),
+		slog.String("scalar", secretState(k.Scalar != nil)),
+		slog.String("private_key", secretState(k.PrivateKey != nil)),
+	)
 }
 
 var p256Order = elliptic.P256().Params().N
@@ -503,8 +603,8 @@ var p256Order = elliptic.P256().Params().N
 // bias negligible. Reducing mod n-1 and adding one yields a scalar in [1, n-1], excluding
 // zero, which is not a valid private key.
 func KeypairFromSeed(seed []byte) (*SeedKeypair, error) {
-	if len(seed) != keyLen {
-		return nil, fmt.Errorf("a seed is %d bytes, got %d", keyLen, len(seed))
+	if len(seed) != SeedLength {
+		return nil, fmt.Errorf("a seed is %d bytes, got %d", SeedLength, len(seed))
 	}
 
 	wide, err := hkdfDerive(seed, nil, "crs-ecdh-p256-scalar", 48)

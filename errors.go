@@ -35,6 +35,18 @@ var (
 	// exists to provide — that the server *cannot* reconstruct the custody private key — is
 	// gone the moment it reaches the wire.
 	ErrCustodySecretTransmitted = errors.New("the custody secret was about to be transmitted")
+
+	// ErrRequestSeedTransmitted fires at the create boundary if a secure request's private
+	// seed was about to leave the machine.
+	//
+	// The mirror of ErrCustodySecretTransmitted, for the other secret this SDK holds that the
+	// server must never see. A request's seed IS the ability to read its submissions: the
+	// public half is published so submitters can seal to it, and the seed stays here, which is
+	// what makes one submitter unable to read another's and us unable to read any of them. If
+	// it reaches the wire that property is gone for every submission the request will ever
+	// collect, so the remedy is to expire the request and create a new one under a new seed -
+	// not to retry.
+	ErrRequestSeedTransmitted = errors.New("the request seed was about to be transmitted")
 )
 
 // An APIError is any refusal from the API.

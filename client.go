@@ -32,6 +32,10 @@ const (
 	// idempotencyConflictCode marks an Idempotency-Key replayed with a different body.
 	idempotencyConflictCode = 105
 
+	// idempotencyHeader is the header the API requires on a create, and which request()
+	// supplies on a POST, PUT or PATCH that did not bring one of its own.
+	idempotencyHeader = "Idempotency-Key"
+
 	credentialPrefix = "crs_sk_live_"
 
 	// DefaultMaxRetries applies to network failures only, never to an HTTP status: a 5xx may
@@ -44,6 +48,30 @@ const (
 	// with a timeout of its own is supplied.
 	DefaultTimeout = 30 * time.Second
 )
+
+// idempotencyKeyedMethods are the methods request() adds an Idempotency-Key to by itself, and
+// the reason that list is three methods rather than "everything that is not a GET".
+//
+// The header exists to stop a network retry from CREATING a second thing. Those are the calls
+// where repeating a request differs from making it once, and on this API they are POST, PUT
+// and PATCH: the server consults the header on a create and nowhere else.
+//
+// DELETE is deliberately absent, and the absence is a compatibility guarantee as much as a
+// design one. ExpireShare is a DELETE /shares/{code} that shipped at 0.1.4 sending no such
+// header, so adding one would change the bytes of an already-published call — a wire change
+// this minor release does not get to make — in exchange for nothing, because the endpoint does
+// not read the header and a repeated delete is idempotent by construction: the row is gone
+// either way. GET is absent for the plainer reason that a read cannot create anything twice,
+// and minting a key per read would fill the API's idempotency store with values nothing will
+// replay.
+//
+// This governs only what the SDK adds on its own. A key the CALLER supplies is forwarded on
+// ANY method, DELETE included, exactly as they wrote it.
+var idempotencyKeyedMethods = map[string]bool{
+	http.MethodPost:  true,
+	http.MethodPut:   true,
+	http.MethodPatch: true,
+}
 
 // A Credential is a parsed API credential: crs_sk_live_<keyId>.<authSecret>[.<custodySecret>].
 //
@@ -322,6 +350,42 @@ func (c *Client) LinkFor(shortCode string, contentKey []byte) (string, error) {
 	return c.linkOrigin + "/" + shortCode + "#" + fragment, nil
 }
 
+// CollectLinkFor is the keyless collect link for a secure request — the one you hand to a
+// human.
+//
+// Deliberately without a fragment. Holding this link lets somebody SUBMIT and never read,
+// which is what makes it safe to paste into a ticket. AccessLinkFor is the other half.
+//
+// Not derivable from any API response: the /r/ segment and the origin are the application's,
+// not the API's, so a caller assembling this by hand is guessing at both.
+func (c *Client) CollectLinkFor(shortCode string) string {
+	return c.linkOrigin + "/r/" + shortCode
+}
+
+// AccessLinkFor is YOUR link for a secure request: the seed in the fragment, which browsers
+// never send to a server.
+//
+// Treat the result as the secret itself — it is the ability to read every submission to that
+// request, on any device, with nothing stored. We cannot rebuild it, because the seed was
+// never ours. Useful for turning a seed you stored at create time back into a link.
+//
+// The fragment is "1" + unpadded base64url, the same encoding EncodeFragment produces for a
+// share's content key and the same one the application's own reader parses. A hand-assembled
+// link is where the version prefix gets left off, and a link missing it fails as though the
+// request were gone.
+func (c *Client) AccessLinkFor(shortCode string, seed []byte) (string, error) {
+	if len(seed) != SeedLength {
+		return "", fmt.Errorf(
+			"%w: a request seed is %d bytes, got %d", ErrMalformedKey, SeedLength, len(seed),
+		)
+	}
+	fragment, err := EncodeFragment(seed)
+	if err != nil {
+		return "", err
+	}
+	return c.linkOrigin + "/r/" + shortCode + "#" + fragment, nil
+}
+
 // ReadLink is not implemented, on purpose.
 //
 // The recipient path is deliberately absent from the API, because bearer auth skips the
@@ -414,7 +478,7 @@ func (c *Client) CreateShare(ctx context.Context, params CreateParams) (*Share, 
 	}
 
 	data, err := c.request(ctx, http.MethodPost, "/shares", body, nil,
-		map[string]string{"Idempotency-Key": idempotencyKey})
+		map[string]string{idempotencyHeader: idempotencyKey})
 	if err != nil {
 		return nil, err
 	}
@@ -557,6 +621,47 @@ func (c *Client) ExpireShare(ctx context.Context, shortCode string) error {
 	return err
 }
 
+// A Call is one request to an endpoint this SDK does not wrap. See [Client.Do].
+type Call struct {
+	// Method is an HTTP method; empty means GET.
+	Method string
+	// Path is appended to the base URL and starts with a slash, as in "/shares".
+	Path string
+	// Body is serialised as JSON when non-nil.
+	Body any
+	// Query is appended as a query string.
+	Query url.Values
+	// Headers are applied AFTER this client's own, so a name set here — Authorization
+	// included — replaces what it would have sent. That is a way to break authentication
+	// rather than a way to act as somebody else; build a second Client for that.
+	Headers map[string]string
+}
+
+// Do performs one call against an endpoint this SDK does not wrap, returning the decoded
+// JSON object.
+//
+// The escape hatch, and it exists because the API outlives this SDK's coverage of it. A new
+// endpoint, or a member of a response the typed methods drop, should not force a caller to
+// reimplement authentication, retries, error mapping and the custody-secret boundary check —
+// all of which apply here exactly as they do to CreateShare.
+//
+// It does not widen what a credential may do. The same bearer token and the same scopes
+// decide that, and the recipient read path ReadLink refuses is not on this API at all, so
+// there is nothing here to reach it with.
+//
+// A POST, PUT or PATCH is given an Idempotency-Key when Call.Headers does not carry one,
+// generated once and repeated across this client's own retries. A GET and a DELETE are given
+// nothing: neither endpoint reads the header, and a DELETE is idempotent by construction — see
+// idempotencyKeyedMethods. Supply your own when you need a value you can reproduce yourself; a
+// supplied one is never overwritten, and it is sent on whatever method you set.
+func (c *Client) Do(ctx context.Context, call Call) (map[string]any, error) {
+	method := call.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	return c.request(ctx, method, call.Path, call.Body, call.Query, call.Headers)
+}
+
 func (c *Client) request(
 	ctx context.Context,
 	method, path string,
@@ -568,8 +673,53 @@ func (c *Client) request(
 	// Belt and braces. bearer() is assembled from parts so a custody secret cannot reach the
 	// header, but this asserts the property at the boundary rather than trusting a constructor
 	// in another file.
-	if c.Credential.custodySecret != "" && strings.Contains(authorization, c.Credential.custodySecret) {
-		return nil, fmt.Errorf("%w; rotate this credential", ErrCustodySecretTransmitted)
+	if c.Credential.custodySecret != "" {
+		if strings.Contains(authorization, c.Credential.custodySecret) {
+			return nil, fmt.Errorf("%w; rotate this credential", ErrCustodySecretTransmitted)
+		}
+		// Headers can be caller-supplied now that Do exposes them, and the realistic accident
+		// is the whole three-part credential pasted into one. The assertion is about the
+		// property rather than about which line assembled the value, so it covers these too.
+		for name, value := range headers {
+			if strings.Contains(value, c.Credential.custodySecret) {
+				return nil, fmt.Errorf(
+					"%w in the %s header; rotate this credential",
+					ErrCustodySecretTransmitted, name,
+				)
+			}
+		}
+	}
+
+	// The Idempotency-Key backstop: a POST, PUT or PATCH carries one whether or not the
+	// method that built it remembered to.
+	//
+	// Allow-listed rather than "not a GET", and the difference is DELETE — see
+	// idempotencyKeyedMethods: a generated key is inert at that endpoint and would change the
+	// bytes ExpireShare has published since 0.1.4.
+	//
+	// Generated ONCE here rather than per attempt. The header's whole value is that a retried
+	// write is recognised as the same write, and a fresh key on the second attempt is exactly
+	// how one secret becomes two — each with its own link and audit trail, under a caller who
+	// believes it created one.
+	//
+	// A key the caller supplied is never overwritten, whatever its capitalisation, and it is
+	// forwarded on any method including DELETE: they may be reproducing a value of their own
+	// on retry, which is the reason the API accepts any string, and clobbering it would defeat
+	// the point of setting it.
+	if idempotencyKeyedMethods[strings.ToUpper(method)] &&
+		headerValue(headers, idempotencyHeader) == "" {
+		generated, err := randomToken()
+		if err != nil {
+			return nil, err
+		}
+		// Copied rather than mutated: the map belongs to the caller, and a second call made
+		// with the same map must not inherit this call's key.
+		resolved := make(map[string]string, len(headers)+1)
+		for name, value := range headers {
+			resolved[name] = value
+		}
+		resolved[idempotencyHeader] = generated
+		headers = resolved
 	}
 
 	target := c.baseURL + path
@@ -707,6 +857,22 @@ func errorFor(response *http.Response, parsed map[string]any, raw []byte) error 
 	return apiErr
 }
 
+// headerValue looks a header up case-insensitively.
+//
+// http.Header canonicalises names on Set, but this map is the caller's own, so
+// "idempotency-key" and "Idempotency-Key" both arrive and both mean the same thing to the
+// API. A case-sensitive lookup would have generated one of ours as well, and since both
+// names canonicalise to the same header, map iteration order would decide which of the
+// two the API saw.
+func headerValue(headers map[string]string, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			return value
+		}
+	}
+	return ""
+}
+
 func intFrom(value any, fallback int) int {
 	switch typed := value.(type) {
 	case float64:
@@ -739,4 +905,4 @@ func min(a, b int) int {
 const userAgent = "credenshare-go/" + Version
 
 // Version of this SDK.
-const Version = "0.1.4"
+const Version = "0.2.0"
