@@ -37,8 +37,10 @@ import (
 	"strings"
 )
 
-// FieldTypes are the types the recipient view knows how to render (section 2.2.1).
-var FieldTypes = []string{"text", "password", "date", "multiline", "markdown", "source_code"}
+// FieldTypes are the types the recipient view knows how to render (section 2.2.1). "url" is a
+// link, made clickable only for an absolute http(s) address; "qr" is text drawn as a QR code,
+// at most 2,300 characters. Neither is checked here: ValidateFields only requires a Type.
+var FieldTypes = []string{"text", "password", "date", "multiline", "markdown", "source_code", "url", "qr"}
 
 // A Field is one labelled value in a share.
 //

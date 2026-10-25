@@ -263,6 +263,23 @@ func TestValidateFieldsRefusesAnEmptyKey(t *testing.T) {
 	}
 }
 
+func TestFieldTypesMatchTheAppAndOnlyPresenceIsChecked(t *testing.T) {
+	// url and qr reached the app on 2026-10-24. The type rides inside the ciphertext, so the
+	// server never sees it and this SDK does not police it: the 2,300-character QR limit is the
+	// app editor's, not a wire rule.
+	want := "text,password,date,multiline,markdown,source_code,url,qr"
+	if got := strings.Join(FieldTypes, ","); got != want {
+		t.Fatalf("FieldTypes = %s, want %s", got, want)
+	}
+	err := ValidateFields([]Field{
+		{Key: "Docs", Value: "not a link", Type: "url"},
+		{Key: "Wi-Fi", Value: strings.Repeat("x", 2301), Type: "qr"},
+	})
+	if err != nil {
+		t.Fatalf("got %v, want the fields accepted", err)
+	}
+}
+
 func TestARecipientPublicKeyMustBeAnUncompressedPoint(t *testing.T) {
 	for _, key := range [][]byte{make([]byte, pubKeyLen), make([]byte, 64)} {
 		if _, err := WrapToPublicKey(make([]byte, keyLen), key); err == nil {
