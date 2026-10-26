@@ -149,6 +149,12 @@ var (
 	// ErrInvalidField marks a field object that does not match the wire format.
 	ErrInvalidField = errors.New("a field is not valid")
 
+	// ErrInvalidArgument marks an argument this SDK refused before anything was sent or
+	// generated: a NotifyOn event the API does not know, a list status other than active or
+	// expired, or generator options out of range. Separate from ErrInvalidField, which is about
+	// a field object, so each keeps a description that fits all its call sites.
+	ErrInvalidArgument = errors.New("an argument is not valid")
+
 	// ErrAPI is the fallback for a refusal with no more specific sentinel, so that
 	// errors.Is(err, ErrAPI) matches every APIError rather than only some of them.
 	ErrAPI = errors.New("the API refused this request")

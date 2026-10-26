@@ -624,6 +624,26 @@ func assertSeedStaysHere(seed []byte, body map[string]any, idempotencyKey string
 // The limit defaults to 25, which is the API's own default for every v1 list, and the server
 // caps it at 100.
 func (c *Client) ListRequests(ctx context.Context, limit, page int) (*RequestPage, error) {
+	return c.listRequests(ctx, "", limit, page)
+}
+
+// ListRequestsByStatus is ListRequests for StatusActive or StatusExpired.
+//
+// The expired list is the requests that have closed. A deleted request is in neither list.
+func (c *Client) ListRequestsByStatus(
+	ctx context.Context, status ListStatus, limit, page int,
+) (*RequestPage, error) {
+	if err := status.validate(); err != nil {
+		return nil, err
+	}
+	return c.listRequests(ctx, status, limit, page)
+}
+
+// listRequests sends status only when one was asked for, so ListRequests sends the bytes it
+// always has.
+func (c *Client) listRequests(
+	ctx context.Context, status ListStatus, limit, page int,
+) (*RequestPage, error) {
 	if limit <= 0 {
 		limit = 25
 	}
@@ -634,6 +654,9 @@ func (c *Client) ListRequests(ctx context.Context, limit, page int) (*RequestPag
 	query := url.Values{}
 	query.Set("limit", strconv.Itoa(limit))
 	query.Set("page", strconv.Itoa(page))
+	if status != "" {
+		query.Set("status", string(status))
+	}
 
 	data, err := c.request(ctx, http.MethodGet, "/requests", nil, query, nil)
 	if err != nil {
@@ -674,6 +697,22 @@ const maxPages = 100_000
 // middle of a result set, and it terminates on the counter it controls rather than on the
 // page number the server echoes. Returning a non-nil error from fn stops the walk.
 func (c *Client) IterateRequests(ctx context.Context, limit int, fn func(RequestSummary) error) error {
+	return c.iterateRequests(ctx, "", limit, fn)
+}
+
+// IterateRequestsByStatus is IterateRequests over StatusActive or StatusExpired.
+func (c *Client) IterateRequestsByStatus(
+	ctx context.Context, status ListStatus, limit int, fn func(RequestSummary) error,
+) error {
+	if err := status.validate(); err != nil {
+		return err
+	}
+	return c.iterateRequests(ctx, status, limit, fn)
+}
+
+func (c *Client) iterateRequests(
+	ctx context.Context, status ListStatus, limit int, fn func(RequestSummary) error,
+) error {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -684,7 +723,7 @@ func (c *Client) IterateRequests(ctx context.Context, limit int, fn func(Request
 					"walked any further", ErrAPI, maxPages,
 			)
 		}
-		batch, err := c.ListRequests(ctx, limit, page)
+		batch, err := c.listRequests(ctx, status, limit, page)
 		if err != nil {
 			return err
 		}

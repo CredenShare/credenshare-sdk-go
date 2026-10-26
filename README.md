@@ -86,6 +86,21 @@ The passcode is mixed into the key derivation and never sent. The server receive
 one-way verifier, so it can check an attempt without gaining the ability to decrypt. Share the
 link and the passcode over different channels — that is the point of having both.
 
+## Activity emails
+
+```go
+share, err := client.CreateShare(ctx, credenshare.CreateParams{
+    Title:    "Deploy key",
+    Fields:   fields,
+    NotifyOn: []string{"viewed", "denied"},
+})
+```
+
+`NotifyOn` emails the share's creator when it is viewed, when a view is refused, when it
+expires or when it is deleted: any of `viewed`, `denied`, `expired` and `deleted`, each at most
+once, the same choice as the app's "Email me when". An unknown or repeated event is refused
+with `ErrInvalidArgument` before anything is encrypted or sent.
+
 ## Listing and expiring
 
 ```go
@@ -98,7 +113,15 @@ err = client.IterateShares(ctx, 100, func(s credenshare.ShareSummary) error {
 })
 
 err = client.ExpireShare(ctx, "aB3dEf12")
+
+// Shares that have ended, by date, views or deletion, newest expiry first.
+ended, err := client.ListSharesByStatus(ctx, credenshare.StatusExpired, 50, 1)
+err = client.IterateSharesByStatus(ctx, credenshare.StatusExpired, 100, visit)
 ```
+
+`ListRequestsByStatus` and `IterateRequestsByStatus` do the same for secure requests: the
+expired list is the requests that have closed, and a deleted request is in neither.
+`ListShares` and `ListRequests` read the active list, as they always have.
 
 `ListShares` and `GetShare` return **metadata only** — never content, never a key. A short code
 belonging to another account reports exactly as one that does not exist, so a credential cannot
@@ -227,6 +250,76 @@ for _, day := range stats.DailyViews {   // oldest first, zero-filled
 Cheaper than paging the share list to count. The per-member breakdown the dashboard shows is
 deliberately absent from the API: a credential scoped to read statistics should not become a
 way to enumerate colleagues.
+
+## Who opened a share
+
+```go
+page, err := client.GetAccessLog(ctx, "aB3dEf12", &credenshare.AccessLogOptions{Limit: 50})
+for _, e := range page.Entries {          // newest first
+    fmt.Println(e.AccessedAt, e.AccessedIP, e.Platform, e.FailedPasscode, e.SignedIn)
+}
+
+err = client.IterateAccessLog(ctx, "aB3dEf12", &credenshare.AccessLogOptions{
+    From: time.Now().AddDate(0, 0, -7),
+}, func(e credenshare.AccessLogEntry) error { return nil })
+```
+
+The access log the app shows under Access History. It needs the `audit:read` scope, which
+`shares:read` does not include because the log carries recipients' IP addresses. Only the
+share's creator can read it, for a live share or one that has ended; any other short code is
+`ErrNotFound`.
+
+Pages are cursor-based: `IterateAccessLog` follows `NextCursor` to the end, and `GetAccessLog`
+with `Cursor` reads one page further back. The plan's retention applies whatever `From` says,
+and `RetentionDays`, `EffectiveFrom` and `EffectiveTo` report the window used.
+
+Each page carries a weak `ETag`. Pass it back as `IfNoneMatch` and an unchanged page returns
+with `NotModified` set rather than as an error. The window's ends default to the current time,
+so an unchanged page is only likely when both `From` and `To` are set.
+
+`UserAgent` is the raw user agent, nil when none was recorded; link previews and scanners show
+up there. `SignedIn` says whether the viewer was signed in, not who they were.
+
+## Capabilities
+
+```go
+caps, err := client.GetCapabilities(ctx, nil)
+fmt.Println(caps.Plan.Name, caps.Key.Scopes, caps.Limits.RemainingShares)
+if caps.Features["secure_requests"] { /* ... */ }
+```
+
+What this credential may do: its scopes and rate limit, its plan (the team's for a team key),
+the plan's limits and features, and the lists the API accepts. No scope is needed. In
+`Limits`, `credenshare.Unlimited` (-1) means the plan sets none. `SharingPolicy` is the team's
+sharing policy for a team key, so it can be met before creating anything, and nil for a
+personal key. `ETag` and `IfNoneMatch` work as they do for the access log.
+
+## Generating a password, passphrase or PIN
+
+```go
+password, err := credenshare.GeneratePassword(credenshare.PasswordOptions{})   // 20 characters
+phrase, err := credenshare.GeneratePassphrase(credenshare.PassphraseOptions{Words: 6, Separator: "space"})
+pin, err := credenshare.GeneratePIN(8)
+fmt.Println(phrase.Bits, phrase.Strength)   // 77.5 Strong
+```
+
+Generated on this machine, with nothing sent anywhere: the app's three modes, with the same
+character sets and the same strength figures.
+
+- **Password:** 8 to 128 characters (default 20) from upper and lower case, numbers and the
+  symbols ``!@#$%^&*()_+-=[]{}|;:,.<>?`"~/'``, any set switched off with `NoUppercase`,
+  `NoLowercase`, `NoNumbers` or `NoSymbols`, and any characters left out with `Exclude`.
+- **Passphrase:** 3 to 12 words (default 5) from the EFF long word list, 7,776 words, joined
+  by `hyphen` (the default), `space`, `period`, `underscore` or `none`. `Capitalize`
+  upper-cases each word; `IncludeNumber` adds one digit to one word.
+- **PIN:** 4 to 12 digits (default 6).
+
+Every draw is uniform: `crypto/rand` rejection-samples, where reducing random bytes with `%`
+would favour some characters. `Bits` is the entropy of what the options generate: length times
+log2 of the pool for a password, words times log2(7,776) for a passphrase, plus log2(10) and
+log2(words) for the digit. `Strength` is Weak below 40 bits, Fair below 60, Strong below 80 and
+Very Strong from there, as the app labels it. Out-of-range options are refused with
+`ErrInvalidArgument` rather than adjusted. Printing a `Generated` withholds its `Value`.
 
 ## Idempotency and retries
 
@@ -397,6 +490,7 @@ Branch with `errors.Is`; reach the status and request id with `errors.As` to `*A
 | `ErrDeliveryUnknown` | delivered, but no response was read | it may have committed. Repeat the identical request — a fresh key here is how one secret becomes two |
 | `ErrNotFound` | no such share, or not yours | a code from another account reads exactly like one that never existed |
 | `ErrInvalidField` | a field is not `{Key, Value, Type}` | `Key` is the visible label — not "label", "name" or "title" |
+| `ErrInvalidArgument` | an argument was refused before anything was sent or generated | a `NotifyOn` event, a list status, access-log options or generator options out of range |
 | `ErrNotSupported` | the operation is deliberately absent | `ReadLink` — open the link in a browser instead |
 | `ErrCustodySecretTransmitted` | the custody secret was about to be sent | rotate the credential; the zero-knowledge property is gone once it reaches the wire |
 | `ErrRequestSeedTransmitted` | a request seed was about to be sent | expire the request and create a new one — do not retry |

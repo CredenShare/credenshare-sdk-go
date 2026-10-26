@@ -247,6 +247,12 @@ type CreateParams struct {
 
 	OrganizationID string
 
+	// NotifyOn emails the share's creator when it is viewed, when a view is refused, when it
+	// expires or when it is deleted: any of NotifyOnEvents, each at most once. The same choice
+	// as the app's "Email me when". Checked here before anything is encrypted or sent, as the
+	// API checks it. Empty sends nothing, exactly as before it existed.
+	NotifyOn []string
+
 	// IdempotencyKey is generated per call unless you set it. Setting your own does NOT make
 	// a second call a no-op: encryption is randomised per call, so the body differs and the
 	// API refuses with ErrIdempotencyConflict. That is the header working, not failing. What
@@ -256,6 +262,31 @@ type CreateParams struct {
 	// ContentKey creates a share under a key you already hold — a link you handed out before
 	// the create, or a fixed key in a test. It does not make the request body reproducible.
 	ContentKey []byte
+}
+
+// NotifyOnEvents are the events CreateParams.NotifyOn accepts, in the API's order. The API
+// publishes the same list in Capabilities.NotifyOnEvents.
+var NotifyOnEvents = []string{"viewed", "denied", "expired", "deleted"}
+
+// validateNotifyOn applies the API's rule — at most four, no repeats, each a known event — so a
+// typo is refused here rather than after a share has been encrypted and sent.
+func validateNotifyOn(events []string) error {
+	seen := make(map[string]bool, len(events))
+	for _, event := range events {
+		known := false
+		for _, candidate := range NotifyOnEvents {
+			known = known || event == candidate
+		}
+		if !known {
+			return fmt.Errorf("%w: NotifyOn %q is not one of %s",
+				ErrInvalidArgument, event, strings.Join(NotifyOnEvents, ", "))
+		}
+		if seen[event] {
+			return fmt.Errorf("%w: NotifyOn lists %q twice", ErrInvalidArgument, event)
+		}
+		seen[event] = true
+	}
+	return nil
 }
 
 // Options configure a Client.
@@ -404,6 +435,9 @@ func (c *Client) ReadLink(_ string) ([]Field, error) {
 // Each field's Key is the visible label — not "label", "name" or "title", which the recipient
 // view ignores silently and would render blank.
 func (c *Client) CreateShare(ctx context.Context, params CreateParams) (*Share, error) {
+	if err := validateNotifyOn(params.NotifyOn); err != nil {
+		return nil, err
+	}
 	contentKey := params.ContentKey
 	if contentKey == nil {
 		var err error
@@ -466,6 +500,9 @@ func (c *Client) CreateShare(ctx context.Context, params CreateParams) (*Share, 
 	if params.TimedView > 0 {
 		body["timed_view"] = params.TimedView
 	}
+	if len(params.NotifyOn) > 0 {
+		body["notify_on"] = params.NotifyOn
+	}
 
 	idempotencyKey := params.IdempotencyKey
 	if idempotencyKey == "" {
@@ -501,6 +538,26 @@ func (c *Client) CreateShare(ctx context.Context, params CreateParams) (*Share, 
 
 // ListShares returns one page of the account's shares, newest first. Metadata only.
 func (c *Client) ListShares(ctx context.Context, limit, page int) (*SharePage, error) {
+	return c.listShares(ctx, "", limit, page)
+}
+
+// ListSharesByStatus is ListShares for StatusActive or StatusExpired.
+//
+// The expired list is the shares that have ended, by date, by views or by deletion, newest
+// expiry first, in the same thin shape. A share appears there once the server has archived it.
+// GetShare still reports an ended share as ErrNotFound; this list is where it can be found.
+func (c *Client) ListSharesByStatus(
+	ctx context.Context, status ListStatus, limit, page int,
+) (*SharePage, error) {
+	if err := status.validate(); err != nil {
+		return nil, err
+	}
+	return c.listShares(ctx, status, limit, page)
+}
+
+// listShares sends status only when one was asked for, so ListShares sends the bytes it always
+// has.
+func (c *Client) listShares(ctx context.Context, status ListStatus, limit, page int) (*SharePage, error) {
 	if limit <= 0 {
 		limit = 25
 	}
@@ -511,6 +568,9 @@ func (c *Client) ListShares(ctx context.Context, limit, page int) (*SharePage, e
 	query := url.Values{}
 	query.Set("limit", strconv.Itoa(limit))
 	query.Set("page", strconv.Itoa(page))
+	if status != "" {
+		query.Set("status", string(status))
+	}
 
 	data, err := c.request(ctx, http.MethodGet, "/shares", nil, query, nil)
 	if err != nil {
@@ -549,11 +609,27 @@ func (c *Client) ListShares(ctx context.Context, limit, page int) (*SharePage, e
 // the first page shorter than the limit, which is a page the server is entitled to return in
 // the middle of a result set. Returning a non-nil error from fn stops the walk.
 func (c *Client) IterateShares(ctx context.Context, limit int, fn func(ShareSummary) error) error {
+	return c.iterateShares(ctx, "", limit, fn)
+}
+
+// IterateSharesByStatus is IterateShares over StatusActive or StatusExpired.
+func (c *Client) IterateSharesByStatus(
+	ctx context.Context, status ListStatus, limit int, fn func(ShareSummary) error,
+) error {
+	if err := status.validate(); err != nil {
+		return err
+	}
+	return c.iterateShares(ctx, status, limit, fn)
+}
+
+func (c *Client) iterateShares(
+	ctx context.Context, status ListStatus, limit int, fn func(ShareSummary) error,
+) error {
 	if limit <= 0 {
 		limit = 100
 	}
 	for page := 1; ; page++ {
-		batch, err := c.ListShares(ctx, limit, page)
+		batch, err := c.listShares(ctx, status, limit, page)
 		if err != nil {
 			return err
 		}
@@ -669,6 +745,31 @@ func (c *Client) request(
 	query url.Values,
 	headers map[string]string,
 ) (map[string]any, error) {
+	reply, err := c.exchange(ctx, method, path, body, query, headers, false)
+	if err != nil {
+		return nil, err
+	}
+	return reply.data, nil
+}
+
+// An apiReply is a successful exchange: the decoded body, and the parts of the envelope the
+// conditional reads need.
+type apiReply struct {
+	data        map[string]any
+	etag        string
+	notModified bool
+}
+
+// exchange is request with the envelope kept. With acceptNotModified, a 304 is an answer
+// rather than an error: the caller sent If-None-Match, and "unchanged" is what it asked.
+func (c *Client) exchange(
+	ctx context.Context,
+	method, path string,
+	body any,
+	query url.Values,
+	headers map[string]string,
+	acceptNotModified bool,
+) (*apiReply, error) {
 	authorization := "Bearer " + c.Credential.bearer()
 	// Belt and braces. bearer() is assembled from parts so a custody secret cannot reach the
 	// header, but this asserts the property at the boundary rather than trusting a constructor
@@ -789,13 +890,17 @@ func (c *Client) request(
 			return nil, fmt.Errorf("reading the response: %w", readErr)
 		}
 
+		if acceptNotModified && response.StatusCode == http.StatusNotModified {
+			return &apiReply{etag: response.Header.Get("ETag"), notModified: true}, nil
+		}
+
 		parsed := map[string]any{}
 		if len(raw) > 0 {
 			_ = json.Unmarshal(raw, &parsed)
 		}
 
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
-			return parsed, nil
+			return &apiReply{data: parsed, etag: response.Header.Get("ETag")}, nil
 		}
 		return nil, errorFor(response, parsed, raw)
 	}

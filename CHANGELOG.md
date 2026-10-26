@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+The /v1 additions of Gitea #404 (who opened a share, what a key may do, the expired lists and
+activity emails) and a local generator. Additive: every existing method sends the bytes it sent
+in 0.3.0, and the conformance fixture is byte-identical.
+
+### Added
+
+- **`GetAccessLog` and `IterateAccessLog`**: a share's access log, newest first, with
+  `AccessLogOptions` (`Limit`, `Cursor`, `From`, `To`, `IfNoneMatch`), `AccessLogPage` and
+  `AccessLogEntry`. Needs the `audit:read` scope. The walk follows `NextCursor` and stops with
+  `ErrAPI` if a cursor fails to move.
+- **`GetCapabilities`**: the key's scopes, its plan's limits and features, the team's sharing
+  policy for a team key, and the field types and activity-email events the API accepts.
+- **Conditional reads.** Both return an `ETag`; sent back as `IfNoneMatch`, an unchanged answer
+  comes back with `NotModified` set. A 304 is never an error on these two, and still is on
+  every other call, where an empty result would read as a real one.
+- **`ListSharesByStatus`, `IterateSharesByStatus`, `ListRequestsByStatus` and
+  `IterateRequestsByStatus`** with `StatusActive` and `StatusExpired`: the shares that have
+  ended and the requests that have closed. `ListShares` and `ListRequests` are unchanged and
+  send no status.
+- **`CreateParams.NotifyOn`** and `NotifyOnEvents`: activity emails to the share's creator on
+  `viewed`, `denied`, `expired` or `deleted`, checked as the API checks them.
+- **`GeneratePassword`, `GeneratePassphrase`, `GeneratePIN` and `StrengthOf`**: the app's
+  generator, on this machine, with nothing sent. Uniform draws through `crypto/rand`, the EFF
+  long word list embedded byte-for-byte (attributed in NOTICE), and the app's strength figures.
+  Printing a `Generated` withholds its value.
+- **`ErrInvalidArgument`**, for an argument refused before anything was sent or generated.
+
 ## 0.3.0 — 2026-10-25
 
 The two field types the web app gained on 2026-10-24. Nothing here changes behaviour: a field's
