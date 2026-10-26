@@ -1010,4 +1010,4 @@ func min(a, b int) int {
 const userAgent = "credenshare-go/" + Version
 
 // Version of this SDK.
-const Version = "0.3.0"
+const Version = "0.4.0"
