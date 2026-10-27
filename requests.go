@@ -571,6 +571,7 @@ func (c *Client) CreateRequest(
 	if expired, ok := data["expired_at"].(string); ok {
 		created.ExpiredAt = &expired
 	}
+	c.resolveLinkOrigin(ctx)
 	created.CollectLink = c.CollectLinkFor(created.ShortCode)
 	if created.AccessLink, err = c.AccessLinkFor(created.ShortCode, seed); err != nil {
 		return nil, err

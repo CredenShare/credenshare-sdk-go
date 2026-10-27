@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -291,8 +293,14 @@ func validateNotifyOn(events []string) error {
 
 // Options configure a Client.
 type Options struct {
-	BaseURL    string
+	BaseURL string
+
+	// LinkOrigin is where recipient links are built, such as "https://crs.sh". Set, it is used
+	// as given. Empty, the client asks the API once, on its first create, and uses the team's
+	// custom domain when the credential is a team key whose team has one; otherwise, or when
+	// that question fails, DefaultLinkOrigin. See Client.LinkOrigin.
 	LinkOrigin string
+
 	HTTPClient *http.Client
 
 	// MaxRetries is a pointer so that 0 means "do not retry" rather than "unset".
@@ -316,9 +324,13 @@ type Client struct {
 	Credential *Credential
 
 	baseURL    string
-	linkOrigin string
+	linkOrigin string // as configured; empty when it was not
 	httpClient *http.Client
 	maxRetries int
+
+	// The team's custom domain, learned from /v1/capabilities at most once per client.
+	originOnce sync.Once
+	teamOrigin atomic.Pointer[string]
 }
 
 // New builds a client from a credential.
@@ -342,7 +354,7 @@ func New(credential string, opts *Options) (*Client, error) {
 	client := &Client{
 		Credential: parsed,
 		baseURL:    strings.TrimRight(orDefault(opts.BaseURL, DefaultBaseURL), "/"),
-		linkOrigin: strings.TrimRight(orDefault(opts.LinkOrigin, DefaultLinkOrigin), "/"),
+		linkOrigin: strings.TrimRight(opts.LinkOrigin, "/"),
 		httpClient: opts.HTTPClient,
 		maxRetries: DefaultMaxRetries,
 	}
@@ -369,6 +381,56 @@ func orDefault(value, fallback string) string {
 	return value
 }
 
+// LinkOrigin is the origin this client builds links on: Options.LinkOrigin when it was set;
+// otherwise the team's custom domain when the credential is a team key whose team has one live
+// for new links; otherwise DefaultLinkOrigin.
+//
+// The custom domain is read from /v1/capabilities at most once per client, on the first call to
+// this method or to a create, and the answer is kept, a "none" included. A failed read leaves
+// this client on DefaultLinkOrigin rather than failing anything, and its error is not surfaced.
+// A team's domain serves only that team's shares and requests, which is why only a team key
+// ever gets one: a personal share's link stays on the default.
+func (c *Client) LinkOrigin(ctx context.Context) string {
+	c.resolveLinkOrigin(ctx)
+	return c.origin()
+}
+
+// origin is LinkOrigin without the question: what is known now.
+func (c *Client) origin() string {
+	if c.linkOrigin != "" {
+		return c.linkOrigin
+	}
+	if team := c.teamOrigin.Load(); team != nil && *team != "" {
+		return *team
+	}
+	return DefaultLinkOrigin
+}
+
+func (c *Client) resolveLinkOrigin(ctx context.Context) {
+	if c.linkOrigin != "" {
+		return
+	}
+	c.originOnce.Do(func() {
+		learned := ""
+		if caps, err := c.GetCapabilities(ctx, nil); err == nil && caps.LinkOrigin != nil {
+			learned = bareHTTPSOrigin(*caps.LinkOrigin)
+		}
+		c.teamOrigin.Store(&learned)
+	})
+}
+
+// bareHTTPSOrigin returns raw as "https://host[:port]" when it is exactly that, and "" for
+// anything else. The content key goes into links built on this origin, so an answer that is not
+// a plain https origin is not followed.
+func bareHTTPSOrigin(raw string) string {
+	u, err := url.Parse(strings.TrimRight(raw, "/"))
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return ""
+	}
+	return "https://" + u.Host
+}
+
 // LinkFor assembles a recipient link.
 //
 // The key lives in the fragment, which browsers never send to a server. That is what makes the
@@ -378,7 +440,7 @@ func (c *Client) LinkFor(shortCode string, contentKey []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return c.linkOrigin + "/" + shortCode + "#" + fragment, nil
+	return c.origin() + "/" + shortCode + "#" + fragment, nil
 }
 
 // CollectLinkFor is the keyless collect link for a secure request — the one you hand to a
@@ -390,7 +452,7 @@ func (c *Client) LinkFor(shortCode string, contentKey []byte) (string, error) {
 // Not derivable from any API response: the /r/ segment and the origin are the application's,
 // not the API's, so a caller assembling this by hand is guessing at both.
 func (c *Client) CollectLinkFor(shortCode string) string {
-	return c.linkOrigin + "/r/" + shortCode
+	return c.origin() + "/r/" + shortCode
 }
 
 // AccessLinkFor is YOUR link for a secure request: the seed in the fragment, which browsers
@@ -414,7 +476,7 @@ func (c *Client) AccessLinkFor(shortCode string, seed []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return c.linkOrigin + "/r/" + shortCode + "#" + fragment, nil
+	return c.origin() + "/r/" + shortCode + "#" + fragment, nil
 }
 
 // ReadLink is not implemented, on purpose.
@@ -521,6 +583,7 @@ func (c *Client) CreateShare(ctx context.Context, params CreateParams) (*Share, 
 	}
 
 	shortCode, _ := data["short_code"].(string)
+	c.resolveLinkOrigin(ctx)
 	link, err := c.LinkFor(shortCode, contentKey)
 	if err != nil {
 		return nil, err

@@ -282,6 +282,11 @@ type Capabilities struct {
 	FieldTypes     []string
 	NotifyOnEvents []string
 
+	// LinkOrigin is the team's custom domain, such as "https://links.example.com", for a team
+	// key whose team has one live for new links; nil otherwise. The client uses it for links
+	// when Options.LinkOrigin is not set.
+	LinkOrigin *string
+
 	ETag        string
 	NotModified bool
 }
@@ -336,6 +341,9 @@ func (c *Client) GetCapabilities(ctx context.Context, opts *CapabilitiesOptions)
 	}
 	caps.FieldTypes = stringsFrom(data["field_types"])
 	caps.NotifyOnEvents = stringsFrom(data["notify_on_events"])
+	if origin, ok := data["link_origin"].(string); ok && origin != "" {
+		caps.LinkOrigin = &origin
+	}
 	return caps, nil
 }
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+Links on a team's custom domain (Gitea #412).
+
+### Added
+
+- **Team link origins.** A client with no `Options.LinkOrigin` reads `link_origin` from
+  `/v1/capabilities` once, on its first create, and builds links on the team's custom domain
+  when the credential is a team key whose team has one live for new links. A personal key, a
+  team without a domain, or a failed read stays on `DefaultLinkOrigin`, and the create never
+  fails for it. Only a bare `https://` origin is followed, since the content key goes into the
+  links built on it.
+- **`Client.LinkOrigin(ctx)`**, the origin the client builds links on, and
+  **`Capabilities.LinkOrigin`**.
+
+### Changed
+
+- **One more request, once per client.** An unconfigured client's first create is followed by
+  one `GET /v1/capabilities`. A client with `Options.LinkOrigin` set sends exactly what it sent
+  in 0.4.0.
+- `LinkFor`, `CollectLinkFor` and `AccessLinkFor` use the team's domain once the client has
+  learned it.
+
 ## 0.4.0 — 2026-10-26
 
 The /v1 additions of Gitea #404 (who opened a share, what a key may do, the expired lists and

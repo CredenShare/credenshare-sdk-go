@@ -294,6 +294,27 @@ the plan's limits and features, and the lists the API accepts. No scope is neede
 sharing policy for a team key, so it can be met before creating anything, and nil for a
 personal key. `ETag` and `IfNoneMatch` work as they do for the access log.
 
+## Links on a team's own domain
+
+```go
+client, err := credenshare.New(teamCredential, nil)
+share, err := client.CreateShare(ctx, params) // https://links.example.com/aB3dEf12#1...
+fmt.Println(client.LinkOrigin(ctx))           // the origin this client builds links on
+```
+
+A team can serve its links from its own domain. A client with no `Options.LinkOrigin` asks the
+API once, on its first create, and builds every link on the team's domain when the credential is
+a team key whose team has one live for new links. A personal key's links, and those of a team
+without a domain, stay on `https://crs.sh`: a team's domain serves only that team's shares and
+requests.
+
+Set `Options.LinkOrigin` to choose the origin yourself, and nothing is asked. The answer is kept
+for the life of the client, a "none" included, and a failed question leaves the client on the
+default rather than failing the create. Only a bare `https://` origin is followed, since the
+content key goes into the links built on it. `LinkFor`, `CollectLinkFor` and `AccessLinkFor` use
+the team's domain once the client has learned it, and `Capabilities.LinkOrigin` carries the
+same value.
+
 ## Generating a password, passphrase or PIN
 
 ```go
